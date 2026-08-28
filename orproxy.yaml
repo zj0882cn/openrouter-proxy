@@ -6,7 +6,7 @@
 port: "8787"
 
 # 监听地址（127.0.0.1=仅本机，0.0.0.0=允许远程访问）
-bind: "127.0.0.1"
+bind: "0.0.0.0"
 
 # 上游服务器（代理目标域名或 IP）
 upstream: "openrouter.ai"
@@ -18,7 +18,8 @@ refresh_minutes: 15
 auto_exit_sec: 0
 
 # 远程认证 Token（留空则不认证，支持 header: X-Auth-Token 或 query: ?token=xxx）
-auth_token: ""
+# 生产部署务必设置。测试服（119.3.216.43）当前使用 ts2026proxy
+auth_token: "ts2026proxy"
 
 # 凭据文件路径（Key 列表，与配置文件分离）
 creds_path: "orproxy-creds.yaml"
