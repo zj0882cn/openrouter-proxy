@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1814,11 +1815,15 @@ OPENROUTER_API_KEY: sk-or-v1-YOUR_KEY_HERE
 		logf("🔐 远程认证: X-Auth-Token header 或 ?token= query")
 	}
 
+	// 显式 TCP4 监听（避免 Go 默认把 0.0.0.0 转 IPv6 wildcard，导致 IPv4 包被丢弃）
+	listener, err := net.Listen("tcp4", addr)
+	if err != nil {
+		log.Fatalf("监听失败 %s: %v", addr, err)
+	}
 	server := &http.Server{
-		Addr:    addr,
 		Handler: h,
 	}
-	if err := server.ListenAndServe(); err != nil {
+	if err := server.Serve(listener); err != nil {
 		log.Fatalf("服务器错误: %v", err)
 	}
 }
