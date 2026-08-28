@@ -164,6 +164,29 @@
 
 <script>
 const base = window.location.origin;
+// 把 URL 上的 ?token=... 同步到所有 fetch 的 header（兼容远端 auth_token 鉴权）
+const urlToken = new URLSearchParams(window.location.search).get('token') || '';
+if (urlToken) {
+  sessionStorage.setItem('orproxy_token', urlToken);
+  // 把 token 写入 URL 的 hash 也保留，便于刷新后页面不丢
+  if (!window.location.hash.includes('token=')) {
+    history.replaceState(null, '', window.location.pathname + '?token=' + encodeURIComponent(urlToken) + window.location.hash);
+  }
+}
+const storedToken = urlToken || sessionStorage.getItem('orproxy_token') || '';
+const _origFetch = window.fetch.bind(window);
+window.fetch = (url, opts) => {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  if (storedToken && !opts.headers['X-Auth-Token'] && !opts.headers['x-auth-token']) {
+    if (typeof url === 'string' && url.startsWith('/')) url = window.location.origin + url;
+    // 给同源请求带 token（绝对 URL 也行）
+    const u = typeof url === 'string' ? url : url.url;
+    const sameOrigin = typeof u === 'string' && (u.startsWith('/') || u.startsWith(window.location.origin));
+    if (sameOrigin) opts.headers['X-Auth-Token'] = storedToken;
+  }
+  return _origFetch(url, opts);
+};
 document.getElementById('apiBaseUrl').textContent = base + '/v1';
 
 let sidebarOpen = false, cachedKeys = [], cachedModels = [];
