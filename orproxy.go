@@ -347,6 +347,40 @@ func (h *handler) perKeyDelay(envName string) {
 	h.lastCallMu.Unlock()
 }
 
+// recordCall 记录一次调用到历史，保留最近 60s
+func (h *handler) recordCall(envName string) {
+	now := time.Now().UnixMilli()
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.callHistory[envName] = append(h.callHistory[envName], float64(now))
+	cutoff := float64(now) - 60000
+	h.callHistory[envName] = h.trimHistory(h.callHistory[envName], cutoff)
+}
+
+// record429 记录一次 429，打印频率统计
+func (h *handler) record429(envName string) {
+	now := time.Now().UnixMilli()
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+	h.hist429[envName] = append(h.hist429[envName], float64(now))
+	cutoff := float64(now) - 60000
+	h.hist429[envName] = h.trimHistory(h.hist429[envName], cutoff)
+	n429 := len(h.hist429[envName])
+	ncalls := len(h.callHistory[envName])
+	logf("📊 %s 429 频率: 近60s %d次429/%d次请求 [%s]", fingerprintKey(""), n429, ncalls, envName)
+}
+
+func (h *handler) trimHistory(arr []float64, cutoff float64) []float64 {
+	i := 0
+	for i < len(arr) && arr[i] < cutoff {
+		i++
+	}
+	if i > 0 {
+		return arr[i:]
+	}
+	return arr
+}
+
 // ============ 状态追踪 ============
 type state struct {
 	mu       sync.RWMutex
@@ -566,7 +600,7 @@ func defaultRetryConfig() RetryConfig {
 		Cooldown429Sec:   10,
 		Cooldown401Sec:   86400,
 		Cooldown403Sec:   3600,
-		PerKeyDelaySec:   2,
+		PerKeyDelaySec:   6, // DSH 策略:同 key 调用间隔 6s(429 冻结 10s)
 		WaitRetrySec:     3,
 		WaitMaxSec:       30,
 		FallbackRetrySec: 3,
@@ -591,6 +625,10 @@ type handler struct {
 	retry       RetryConfig
 	lastCallMu  sync.Mutex
 	lastCall    map[string]time.Time // per-key 上次调用时刻（限速用）
+	// 频率统计: 60s 滑动窗口，用于观察 429 阈值
+	statsMu     sync.Mutex
+	callHistory map[string][]float64 // env -> [ts, ts, ...] 近 60s 每次调用
+	hist429     map[string][]float64 // env -> [ts, ts, ...] 近 60s 每次 429
 }
 
 func (h *handler) loadKeys() ([]keyEntry, error) {
@@ -1208,6 +1246,32 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 	fallbackDone := false
 
 	tryProxy := func(body []byte, modelName string, isFreeRouter bool) bool {
+		// DSH 策略: 免费路由第 0 步先试 upstream_free（无认证，不耗 Key 配额）
+		if isFreeRouter {
+			reqStart := time.Now()
+			resp, err := h.upstreamFree(http.MethodPost, "/v1/chat/completions", body)
+			elapsed := time.Since(reqStart)
+			if err == nil {
+				respBody, _ := io.ReadAll(resp.Body)
+				statusCode := resp.StatusCode
+				if statusCode == 200 {
+					logf("✅ [%s] 🌐 无认证 free 成功 [%.1fs]",
+						modelName, elapsed.Seconds())
+					h.copyResponse(w, resp, respBody)
+					return true
+				}
+				// 400/500/502/503 直返不 fallback（DSH 策略）
+				if statusCode == 400 || statusCode >= 500 {
+					logf("❌ [%s] 🌐 无认证 HTTP %d（直返不 fallback）", modelName, statusCode)
+					h.copyResponse(w, resp, respBody)
+					return true
+				}
+				logf("⚠️ [%s] 🌐 无认证 free 失败: HTTP %d（将走 key 轮询）", modelName, statusCode)
+			} else {
+				logf("⚠️ [%s] 🌐 无认证 free 异常: %v（将走 key 轮询）", modelName, err)
+			}
+		}
+
 		// all-cooling 时等待 key 恢复(DSH wait_for_key 策略)
 		if note == "all-cooling" {
 			logf("⚠️ [%s] 所有 key 均冷却中，等待恢复 (wait_max=%ds)...", modelName, h.retry.WaitMaxSec)
@@ -1235,6 +1299,7 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 			reqStart := time.Now()
 			resp, err := h.doUpstream(k.key, http.MethodPost, "/v1/chat/completions", body)
 			elapsed := time.Since(reqStart)
+			h.recordCall(k.envName)
 
 			if err != nil {
 				logf("❌ [%s] %s 网络错误: %v", modelName, fingerprintKey(k.key), err)
@@ -1259,6 +1324,7 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if statusCode == 429 {
+				h.record429(k.envName)
 				coolDur := h.parseCooldown(resp, respBody)
 				until := time.Now().Add(coolDur)
 				h.cooldown.setCooling(k.envName, until)
@@ -1276,25 +1342,31 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if statusCode == 402 || statusCode == 403 {
-				// 402/403: 付费额度不足，1h 冷却（402 沿用 skip 不再等待，直接跳过）
-				coolDur := time.Duration(h.retry.Cooldown403Sec) * time.Second
-				h.cooldown.setCooling(k.envName, time.Now().Add(coolDur))
-				logf("⛔ [%s] %s %d 付费额度不足，冷却%.0f分钟 [%s]",
-					modelName, fingerprintKey(k.key), statusCode, coolDur.Minutes(), k.envName)
+			if statusCode == 402 {
+				// 402: 模型需付费额度，直接跳过（不冷却，DSH 策略）
+				logf("⛔ [%s] %s 402 模型需付费额度，跳过 [%s]",
+					modelName, fingerprintKey(k.key), k.envName)
 				continue
 			}
 
-			detail := string(respBody)
-			if len(detail) > 100 {
-				detail = detail[:100] + "..."
+			if statusCode == 403 {
+				// 403: 付费额度不足，1h 冷却
+				coolDur := time.Duration(h.retry.Cooldown403Sec) * time.Second
+				h.cooldown.setCooling(k.envName, time.Now().Add(coolDur))
+				logf("⛔ [%s] %s 403 付费额度不足，冷却%.0f分钟 [%s]",
+					modelName, fingerprintKey(k.key), coolDur.Minutes(), k.envName)
+				continue
 			}
-			logf("❌ [%s] %s HTTP %d: %s [%s]",
-				modelName, fingerprintKey(k.key), statusCode, detail, k.envName)
-			if i == len(ready)-1 {
+
+			// DSH 策略: 400/500/502/503 直返，不 fallback
+			if statusCode == 400 || statusCode >= 500 {
 				h.copyResponse(w, resp, respBody)
-				return true // 有响应（即使是错误 HTTP 码）也直接返回，不 fallback
+				return true
 			}
+
+			// 其他错误：直返（不 fallback）
+			h.copyResponse(w, resp, respBody)
+			return true
 		}
 		return false
 	}
@@ -1318,11 +1390,10 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 			deadline := time.Now().Add(time.Duration(h.retry.FallbackMaxSec) * time.Second)
 			for round := 1; ; round++ {
 				// 重新 rotate + 取 ready keys（冷却状态已变化）
-				start := h.state.rotateStart(keys)
-				rotated := append(keys[start:], keys[:start]...)
+				start2 := h.state.rotateStart(keys)
+				rotated := append(keys[start2:], keys[:start2]...)
 				ready, note = h.cooldown.readyKeys(rotated)
 				if note == "all-cooling" {
-					// 全部还在冷却:waitForKey 轮询
 					logf("⏳ [fallback round %d] %s，等待 key 恢复...", round, note)
 				}
 				if tryProxy(originalBody, origModelName, false) {
@@ -1424,6 +1495,27 @@ func (h *handler) doUpstream(key, method, path string, body []byte) (*http.Respo
 	return client.Do(req)
 }
 
+// upstreamFree 无认证请求，用于 openrouter/free 兜底（绕过付费 Key 的 429 传染）
+// DSH 策略: free 路由第一轮第 0 步先试这个，省一次 Key 调用
+func (h *handler) upstreamFree(method, path string, body []byte) (*http.Response, error) {
+	upstreamPath := path
+	if strings.HasPrefix(path, "/v1") {
+		upstreamPath = "/api" + path
+	}
+	upstreamURL := fmt.Sprintf("https://%s%s", h.upstream, upstreamPath)
+	req, err := http.NewRequest(method, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "OpenRouter-Go-Proxy/1.0")
+	}
+	client := &http.Client{Timeout: 180 * time.Second}
+	return client.Do(req)
+}
+
 func (h *handler) copyResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
 	w.WriteHeader(resp.StatusCode)
 	for k, vv := range resp.Header {
@@ -1488,8 +1580,8 @@ cooldown_429_sec: 10
 cooldown_401_sec: 86400
 # 403/402 冷却（秒），付费额度不足 → 1h
 cooldown_403_sec: 3600
-# 同一 key 最小调用间隔（秒），DSH 策略：避免单 key 超过 5req/s
-per_key_delay_sec: 2
+# 同一 key 最小调用间隔（秒），DSH 策略：成功也冻结 6s，429 冻结 10s
+per_key_delay_sec: 6
 # 全部冷却时重试间隔（秒）
 wait_retry_sec: 3
 # 全部冷却时最大等待（秒）
@@ -1692,7 +1784,9 @@ OPENROUTER_API_KEY: sk-or-v1-YOUR_KEY_HERE
 			if cfg.BetweenRoundsSec > 0 { rc.BetweenRoundsSec = cfg.BetweenRoundsSec }
 			return rc
 		}(),
-		lastCall: make(map[string]time.Time),
+		lastCall:    make(map[string]time.Time),
+		callHistory: make(map[string][]float64),
+		hist429:     make(map[string][]float64),
 	}
 
 	keys, err := loadKeys(credPath)
