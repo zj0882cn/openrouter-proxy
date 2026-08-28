@@ -653,6 +653,16 @@ func (h *handler) checkAuth(w http.ResponseWriter, r *http.Request) bool {
 	if r.URL.Query().Get("token") == h.authToken {
 		return true
 	}
+	// 兼容 OpenAI 风格的 Authorization: Bearer xxx
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		if strings.HasPrefix(auth, "Bearer ") && auth[7:] == h.authToken {
+			return true
+		}
+		// 也接受直接传 token (不强制 Bearer)
+		if auth == h.authToken {
+			return true
+		}
+	}
 	http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 	return false
 }
