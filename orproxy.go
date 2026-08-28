@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -216,11 +217,11 @@ func loadKeys(credPath string) ([]keyEntry, error) {
 	return keys, nil
 }
 
-func maskKey(k string) string {
-	if len(k) < 4 {
-		return "***"
-	}
-	return k[len(k)-4:]
+func fingerprintKey(k string) string {
+	// 短指纹：SHA256 截断后 4 位，不泄漏明文但可识别同一 key
+	h := sha256.Sum256([]byte(k))
+	fp := fmt.Sprintf("%x", h)
+	return fp[len(fp)-4:]
 }
 
 // ============ 冷却管理 ============
@@ -339,9 +340,14 @@ type FreeModel struct {
 	ID            string `json:"id"`
 	Name          string `json:"name"`
 	ContextLength int    `json:"context_length"`
+	FreeRouter    bool   `json:"free_router"` // true = openrouter/free 官方路由（不消耗 key 额度）
 }
 
 func isFreeModel(m map[string]interface{}) bool {
+	// openrouter/free 是 OpenRouter 官方免费 router：不消耗 key 自己的额度
+	if id, _ := m["id"].(string); id == "openrouter/free" {
+		return true
+	}
 	pricing, ok := m["pricing"].(map[string]interface{})
 	if !ok {
 		return false
@@ -349,6 +355,11 @@ func isFreeModel(m map[string]interface{}) bool {
 	promptStr := fmt.Sprintf("%v", pricing["prompt"])
 	compStr := fmt.Sprintf("%v", pricing["completion"])
 	return promptStr == "0" && compStr == "0"
+}
+
+func isFreeRouter(m map[string]interface{}) bool {
+	id, _ := m["id"].(string)
+	return id == "openrouter/free"
 }
 
 type freeModelsCache struct {
@@ -417,6 +428,7 @@ func (c *freeModelsCache) fetch(key string) {
 			ID:            id,
 			Name:          name,
 			ContextLength: ctxLen,
+			FreeRouter:    isFreeRouter(m),
 		})
 	}
 
@@ -508,6 +520,8 @@ type handler struct {
 	keysMu      sync.Mutex
 	keyManager  *keyManager
 	heartbeat   *heartbeatMgr
+	configPath  string
+	configMu    sync.Mutex // 保护 bind/authToken/upstream 等运行时热更新的字段
 }
 
 func (h *handler) loadKeys() ([]keyEntry, error) {
@@ -551,6 +565,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveModels(w, r)
 	case "/v1/chat/completions":
 		h.proxyChat(w, r)
+	case "/config":
+		h.serveConfig(w, r)
+	case "/config/save":
+		h.saveConfig(w, r)
 	case "/keys":
 		h.manageKeys(w, r)
 	case "/keys/add":
@@ -609,7 +627,7 @@ func (h *handler) serveHealth(w http.ResponseWriter, r *http.Request) {
 		Keys:     []keyStatus{},
 	}
 	for _, k := range keys {
-		ks := keyStatus{Key: fmt.Sprintf("Key%s(%s)", k.slot, maskKey(k.key))}
+		ks := keyStatus{Key: fmt.Sprintf("Key%s(%s)", k.slot, fingerprintKey(k.key))}
 		if h.cooldown.isCooling(k.envName) {
 			h.cooldown.mu.RLock()
 			if t, ok := h.cooldown.coolings[k.envName]; ok {
@@ -642,6 +660,131 @@ func (h *handler) serveFreeModels(w http.ResponseWriter, r *http.Request) {
 	}{Models: models, Stale: false})
 }
 
+// ============ 配置管理 API ============
+// GET  /config         - 读取配置文件原始内容（YAML 文本）
+// POST /config/save    - 保存配置文件内容（YAML 文本）
+//                         字段热更新: bind / auth_token / upstream / port / refresh_minutes / auto_exit_sec / creds_path
+//                         （port/refresh_minutes/auto_exit_sec/creds_path 等需重启才生效的项仅日志提示）
+
+func (h *handler) serveConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":{"message":"GET only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 配置文件不存在就用默认内容
+			data = []byte(defaultConfigYAML)
+		} else {
+			http.Error(w, fmt.Sprintf(`{"error":{"message":"read failed: %v"}}`, err), 500)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}{Path: h.configPath, Content: string(data)})
+}
+
+func (h *handler) saveConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"POST only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"invalid body: %v"}}`, err), 400)
+		return
+	}
+	if body.Content == "" {
+		http.Error(w, `{"error":{"message":"content empty"}}`, 400)
+		return
+	}
+
+	// 先备份原文件到 .bak（首次保存时不存在就跳过）
+	orig, _ := os.ReadFile(h.configPath)
+	if len(orig) > 0 {
+		_ = os.WriteFile(h.configPath+".bak", orig, 0644)
+	}
+
+	// 写到 .tmp，再原子重命名，避免保存中途崩溃破坏文件
+	tmp := h.configPath + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body.Content), 0644); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"write tmp failed: %v"}}`, err), 500)
+		return
+	}
+	if err := os.Rename(tmp, h.configPath); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"rename failed: %v"}}`, err), 500)
+		return
+	}
+
+	// 热更新: 重新解析 yaml，更新可热加载的字段
+	var newCfg AppConfig
+	if err := yaml.Unmarshal([]byte(body.Content), &newCfg); err != nil {
+		logf("⚠️ 配置保存成功但解析失败（需检查 yaml 语法）: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(struct {
+			OK      bool   `json:"ok"`
+			Message string `json:"message"`
+		}{OK: true, Message: "saved (yaml parse failed, no live update): " + err.Error()})
+		return
+	}
+
+	h.configMu.Lock()
+	hotChanges := []string{}
+	if newCfg.Upstream != "" && newCfg.Upstream != h.upstream {
+		old := h.upstream
+		h.upstream = newCfg.Upstream
+		hotChanges = append(hotChanges, fmt.Sprintf("upstream: %s → %s", old, newCfg.Upstream))
+	}
+	if newCfg.Bind != "" && newCfg.Bind != h.bind {
+		old := h.bind
+		h.bind = newCfg.Bind
+		hotChanges = append(hotChanges, fmt.Sprintf("bind: %s → %s", old, newCfg.Bind))
+	}
+	if newCfg.AuthToken != h.authToken {
+		h.authToken = newCfg.AuthToken
+		hotChanges = append(hotChanges, "auth_token: updated")
+	}
+	h.configMu.Unlock()
+
+	// 需要重启的项日志提示
+	restartNeeded := []string{}
+	if newCfg.Port != "" && newCfg.Port != defaultPort {
+		restartNeeded = append(restartNeeded, "port")
+	}
+	if newCfg.RefreshMinutes > 0 {
+		restartNeeded = append(restartNeeded, "refresh_minutes")
+	}
+	if newCfg.AutoExitSec != 0 {
+		restartNeeded = append(restartNeeded, "auto_exit_sec")
+	}
+	if newCfg.CredsPath != "" {
+		restartNeeded = append(restartNeeded, "creds_path")
+	}
+
+	msg := "已保存: " + h.configPath
+	if len(hotChanges) > 0 {
+		msg += "（已热更新: " + strings.Join(hotChanges, ", ") + "）"
+	}
+	if len(restartNeeded) > 0 {
+		msg += "（下次重启生效: " + strings.Join(restartNeeded, ", ") + "）"
+	}
+	logf("📝 " + msg)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		OK      bool     `json:"ok"`
+		Message string   `json:"message"`
+		Hot     []string `json:"hot_updated"`
+		Restart []string `json:"restart_required"`
+	}{OK: true, Message: msg, Hot: hotChanges, Restart: restartNeeded})
+}
+
 // ============ Key 管理 API ============
 // GET  /keys          - 列出所有 Key 状态
 // POST /keys/add       - 添加新 Key（写入 credentials.yaml）
@@ -660,17 +803,17 @@ func (h *handler) manageKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type keyInfo struct {
-		Name      string `json:"name"`
-		Mask      string `json:"mask"`
-		Paused    bool   `json:"paused"`
-		Cooling   bool   `json:"cooling"`
-		CoolUntil string `json:"cooling_until,omitempty"`
+		Name        string `json:"name"`
+		Fingerprint string `json:"fingerprint"`
+		Paused      bool   `json:"paused"`
+		Cooling     bool   `json:"cooling"`
+		CoolUntil   string `json:"cooling_until,omitempty"`
 	}
 	var list []keyInfo
 	for _, k := range keys {
 		ki := keyInfo{
-			Name:    k.envName,
-			Mask:    maskKey(k.key),
+			Name:        k.envName,
+			Fingerprint: fingerprintKey(k.key),
 			Paused:  h.keyManager.isPaused(k.key),
 			Cooling: h.cooldown.isCooling(k.envName),
 		}
@@ -714,22 +857,22 @@ func (h *handler) addKey(w http.ResponseWriter, r *http.Request) {
 	defer h.keysMu.Unlock()
 
 	// 若未指定 envName，自动分配：OPENROUTER_API_KEY (空) / OPENROUTER2/3/4...
+	existing, _ := loadKeys(h.credPath)
+	used := make(map[string]bool)
+	maxSlot := 0
+	hasPrimary := false
+	for _, k := range existing {
+		used[k.envName] = true
+		if k.envName == "OPENROUTER_API_KEY" {
+			hasPrimary = true
+			continue
+		}
+		if n, err := strconv.Atoi(k.slot); err == nil && n > maxSlot {
+			maxSlot = n
+		}
+	}
 	envName := req.EnvName
 	if envName == "" {
-		existing, _ := loadKeys(h.credPath)
-		used := make(map[string]bool)
-		maxSlot := 0
-		hasPrimary := false
-		for _, k := range existing {
-			used[k.envName] = true
-			if k.envName == "OPENROUTER_API_KEY" {
-				hasPrimary = true
-				continue
-			}
-			if n, err := strconv.Atoi(k.slot); err == nil && n > maxSlot {
-				maxSlot = n
-			}
-		}
 		if !hasPrimary {
 			envName = "OPENROUTER_API_KEY"
 		} else {
@@ -743,7 +886,8 @@ func (h *handler) addKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.Contains(string(data), envName) {
+	// 用 loadKeys 已解析的 envName 集合判断重复，避免误中注释行（如 "# OPENROUTER2_API_KEY..."）
+	if used[envName] {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s already exists"}}`, envName), 409)
 		return
 	}
@@ -834,7 +978,7 @@ func (h *handler) pauseKey(w http.ResponseWriter, r *http.Request) {
 
 	var found string
 	for _, k := range keys {
-		if strings.Contains(k.key, req.Key) || maskKey(k.key) == req.Key || k.envName == req.Key {
+		if strings.Contains(k.key, req.Key) || fingerprintKey(k.key) == req.Key || k.envName == req.Key {
 			h.keyManager.pause(k.key)
 			found = k.envName
 			logf("⏸️ 暂停 Key: %s", k.envName)
@@ -877,7 +1021,7 @@ func (h *handler) resumeKey(w http.ResponseWriter, r *http.Request) {
 
 	var found string
 	for _, k := range keys {
-		if strings.Contains(k.key, req.Key) || maskKey(k.key) == req.Key || k.envName == req.Key {
+		if strings.Contains(k.key, req.Key) || fingerprintKey(k.key) == req.Key || k.envName == req.Key {
 			h.keyManager.resume(k.key)
 			found = k.envName
 			logf("▶️ 恢复 Key: %s", k.envName)
@@ -969,6 +1113,14 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 
 	modelName := extractModel(body)
 
+	// 客户端 X-ORProxy-Free: 1 → 强制走 openrouter/free（OpenRouter 官方免费 router，不消耗 key 自己的额度）
+	if strings.EqualFold(r.Header.Get("X-ORProxy-Free"), "1") ||
+		strings.EqualFold(r.Header.Get("X-ORProxy-Free-Router"), "1") {
+		body = rewriteModel(body, "openrouter/free")
+		modelName = "openrouter/free"
+		logf("🌐 走免费 router（不消耗 key 额度）: %s", modelName)
+	}
+
 	keys, err := h.loadKeys()
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err.Error()), 500)
@@ -979,61 +1131,97 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 	rotated := append(keys[start:], keys[:start]...)
 	ready, note := h.cooldown.readyKeys(rotated)
 
-	for i, k := range ready {
-		if h.keyManager.isPaused(k.key) {
-			logf("⏸️ [%s] %s 已暂停，跳过", modelName, maskKey(k.key))
-			continue
+	// 记录原始请求体（免费路由全部失败时 fallback 用）
+	originalBody := body
+	origModelName := extractModel(body)
+
+	// 单次请求内免费路由失败标记，触发后不再重复 fallback
+	fallbackDone := false
+
+	tryProxy := func(body []byte, modelName string, isFreeRouter bool) bool {
+		for i, k := range ready {
+			if h.keyManager.isPaused(k.key) {
+				logf("⏸️ [%s] %s 已暂停，跳过", modelName, fingerprintKey(k.key))
+				continue
+			}
+			if i > 0 || note == "all-cooling" {
+				logf("⚠️ [%s] %s", modelName, note)
+			}
+
+			reqStart := time.Now()
+			resp, err := h.doUpstream(k.key, http.MethodPost, "/v1/chat/completions", body)
+			elapsed := time.Since(reqStart)
+
+			if err != nil {
+				logf("❌ [%s] %s 网络错误: %v", modelName, fingerprintKey(k.key), err)
+				continue
+			}
+
+			respBody, _ := io.ReadAll(resp.Body)
+			statusCode := resp.StatusCode
+
+			if statusCode == 200 {
+				h.state.setLastGood(k.envName)
+				tokens := extractTokens(respBody)
+				if isFreeRouter {
+					logf("✅ [%s] 🌐 免费路由成功 %s %s [%.1fs, %s]",
+						modelName, fingerprintKey(k.key), tokens, elapsed.Seconds(), k.envName)
+				} else {
+					logf("✅ [%s] %s %s [%.1fs, %s]",
+						modelName, fingerprintKey(k.key), tokens, elapsed.Seconds(), k.envName)
+				}
+				h.copyResponse(w, resp, respBody)
+				return true
+			}
+
+			if statusCode == 429 {
+				coolDur := parseCooldown(resp, respBody)
+				until := time.Now().Add(coolDur)
+				h.cooldown.setCooling(k.envName, until)
+				logf("🔁 [%s] %s 429 → 冷却%.0f分钟，换下一条 [%s]",
+					modelName, fingerprintKey(k.key), coolDur.Minutes(), k.envName)
+				continue
+			}
+
+			if statusCode == 402 || statusCode == 403 {
+				logf("⛔ [%s] %s %d 付费额度不足，跳过 [%s]",
+					modelName, fingerprintKey(k.key), statusCode, k.envName)
+				continue
+			}
+
+			detail := string(respBody)
+			if len(detail) > 100 {
+				detail = detail[:100] + "..."
+			}
+			logf("❌ [%s] %s HTTP %d: %s [%s]",
+				modelName, fingerprintKey(k.key), statusCode, detail, k.envName)
+			if i == len(ready)-1 {
+				h.copyResponse(w, resp, respBody)
+				return true // 有响应（即使是错误 HTTP 码）也直接返回，不 fallback
+			}
 		}
-		if i > 0 || note == "all-cooling" {
-			logf("⚠️ [%s] %s", modelName, note)
-		}
+		return false
+	}
 
-		reqStart := time.Now()
-		resp, err := h.doUpstream(k.key, http.MethodPost, "/v1/chat/completions", body)
-		elapsed := time.Since(reqStart)
-
-		if err != nil {
-			logf("❌ [%s] %s 网络错误: %v", modelName, maskKey(k.key), err)
-			continue
-		}
-
-		respBody, _ := io.ReadAll(resp.Body)
-		statusCode := resp.StatusCode
-
-		if statusCode == 200 {
-			h.state.setLastGood(k.envName)
-			tokens := extractTokens(respBody)
-			logf("✅ [%s] %s %s [%.1fs, %s]",
-				modelName, maskKey(k.key), tokens, elapsed.Seconds(), k.envName)
-			h.copyResponse(w, resp, respBody)
+	// 第一轮：走免费路由（body 已在前面被 rewriteModel 改写）
+	if modelName == "openrouter/free" {
+		ok := tryProxy(body, modelName, true)
+		if ok {
 			return
 		}
-
-		if statusCode == 429 {
-			coolDur := parseCooldown(resp, respBody)
-			until := time.Now().Add(coolDur)
-			h.cooldown.setCooling(k.envName, until)
-			logf("🔁 [%s] %s 429 → 冷却%.0f分钟，换下一条 [%s]",
-				modelName, maskKey(k.key), coolDur.Minutes(), k.envName)
-			continue
+		// 免费路由全部失败 → fallback 原始模型
+		if !fallbackDone {
+			fallbackDone = true
+			logf("🔄 免费路由全部失败，fallback 到原始模型: %s", origModelName)
+			ok = tryProxy(originalBody, origModelName, false)
+			if ok {
+				return
+			}
 		}
-
-		if statusCode == 402 || statusCode == 403 {
-			logf("⛔ [%s] %s %d 付费额度不足，跳过 [%s]",
-				modelName, maskKey(k.key), statusCode, k.envName)
-			continue
-		}
-
-		detail := string(respBody)
-		if len(detail) > 100 {
-			detail = detail[:100] + "..."
-		}
-		logf("❌ [%s] %s HTTP %d: %s [%s]",
-			modelName, maskKey(k.key), statusCode, detail, k.envName)
-		if i == len(ready)-1 {
-			h.copyResponse(w, resp, respBody)
-			return
-		}
+	} else {
+		// 非免费路由请求，直接走
+		tryProxy(body, modelName, false)
+		return
 	}
 
 	http.Error(w, `{"error":{"message":"all keys exhausted"}}`, 502)
@@ -1049,6 +1237,20 @@ func extractModel(body []byte) string {
 		return m
 	}
 	return "?"
+}
+
+// rewriteModel 把请求体中的 model 字段重写为新值；解析失败时返回原 body
+func rewriteModel(body []byte, newModel string) []byte {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return body
+	}
+	parsed["model"] = newModel
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // extractTokens 从响应体中提取 token 使用量
@@ -1300,6 +1502,7 @@ OPENROUTER_API_KEY: sk-or-v1-YOUR_KEY_HERE
 		freeModels: newFreeModelsCache(),
 		keyManager: newKeyManager(),
 		heartbeat:  newHeartbeatMgr(cfg.AutoExitSec),
+		configPath: resolvePath(env("CONFIG_PATH", defaultConfigFile)),
 	}
 
 	keys, err := loadKeys(credPath)

@@ -68,6 +68,31 @@
   .shutdown-wrap button { width: 100%; padding: 8px; background: #da3633; border: 1px solid #f85149; border-radius: 4px; color: #fff; font-size: 12px; cursor: pointer; font-family: inherit; font-weight: 600; }
   .shutdown-wrap button:hover { background: #f85149; }
 
+  .config-section { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .config-section .cfg-path { font-size: 10px; color: #484f58; font-family: monospace; word-break: break-all; }
+  .config-section button { width: 100%; padding: 7px; background: #21262d; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .config-section button:hover { background: #30363d; }
+
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 100; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: #161b22; border: 1px solid #30363d; border-radius: 8px; width: 90vw; max-width: 800px; max-height: 90vh; display: flex; flex-direction: column; }
+  .modal-header { padding: 12px 16px; border-bottom: 1px solid #30363d; display: flex; align-items: center; justify-content: space-between; }
+  .modal-header h3 { font-size: 14px; color: #e0e0e0; }
+  .modal-close { background: none; border: none; color: #8b949e; font-size: 18px; cursor: pointer; padding: 0 4px; }
+  .modal-close:hover { color: #e0e0e0; }
+  .modal-body { padding: 12px 16px; flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 10px; }
+  .modal-body .cfg-edit-path { font-size: 11px; color: #484f58; font-family: monospace; word-break: break-all; }
+  .modal-body textarea { width: 100%; min-height: 50vh; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 12px; padding: 8px 10px; line-height: 1.6; resize: vertical; }
+  .modal-body textarea:focus { outline: none; border-color: #58a6ff; }
+  .modal-footer { padding: 12px 16px; border-top: 1px solid #30363d; display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-footer button { padding: 7px 16px; background: #21262d; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .modal-footer button:hover { background: #30363d; }
+  .modal-footer button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  .modal-footer button.primary:hover { background: #2ea043; }
+  .modal-footer .result { margin-right: auto; font-size: 11px; font-family: monospace; align-self: center; }
+  .modal-footer .result.ok { color: #3fb950; }
+  .modal-footer .result.err { color: #f85149; }
+
   #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
   #logPanel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   #logHeader { background: #161b22; border-bottom: 1px solid #30363d; padding: 6px 16px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
@@ -107,11 +132,11 @@
 <body>
 
 <header>
+  <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">菜单</button>
   <h1>🌐 ORProxy</h1>
   <div class="status"><div class="dot ok" id="statusDot"></div><span id="statusText">运行中</span></div>
   <div class="spacer"></div>
   <div class="url" id="apiBaseUrl"></div>
-  <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">☰ 菜单</button>
 </header>
 
 <div class="app">
@@ -129,6 +154,7 @@
           <textarea id="promptInput" placeholder="输入问题…" rows="2"></textarea>
           <button class="send-btn" id="sendBtn" onclick="doSend()">发送 ▶</button>
         </div>
+        <div id="testHint" style="font-size:12px;color:#8b949e;margin-top:6px;display:none;">🌐 所选模型已自动标记为「免费路由」，不消耗 Key 额度</div>
         <div id="testOutput">等待输入…</div>
         <div id="testMeta"></div>
       </div>
@@ -147,8 +173,8 @@ let logEs;
 function toggleSidebar() {
   sidebarOpen = !sidebarOpen;
   const sb = document.getElementById('sidebar');
-  if (sidebarOpen) { sb.classList.add('open'); document.getElementById('menuBtn').textContent = '✕ 关闭'; renderSidebar(); }
-  else { sb.classList.remove('open'); document.getElementById('menuBtn').textContent = '☰ 菜单'; }
+  if (sidebarOpen) { sb.classList.add('open'); document.getElementById('menuBtn').textContent = '菜单'; renderSidebar(); }
+  else { sb.classList.remove('open'); document.getElementById('menuBtn').textContent = '菜单'; }
 }
 
 function renderSidebar() {
@@ -160,6 +186,13 @@ function renderSidebar() {
         <input type="text" id="addKeyInput" placeholder="粘贴 Key（sk-or-v1-…）" oninput="showKeyHint(this)">
         <div class="hint" id="keyHint"></div>
         <button onclick="doAddKey()">➕ 添加</button>
+      </div>
+    </div>
+    <div class="menu-section">
+      <div class="menu-section-header">⚙️ 配置</div>
+      <div class="config-section">
+        <div class="cfg-path" id="cfgPath">orproxy.yaml</div>
+        <button onclick="openConfigModal()">📝 编辑配置文件</button>
       </div>
     </div>
     <div class="menu-section">
@@ -199,7 +232,7 @@ function renderKeyItems(keys) {
     return `<div class="key-item">
       <div class="key-item-top">
         <span class="key-item-name">${k.name}</span>
-        <span class="key-item-mask">🔒 ····${k.mask}</span>
+        <span class="key-item-mask">🔒 sk-or-v1-••••[${k.fingerprint}]</span>
       </div>
       <div class="key-item-row"><span class="dot ${dot}"></span><span>${label}</span></div>
       ${coolHtml}
@@ -301,7 +334,10 @@ function toggleTest() {
 function syncModelSelect() {
   const sel = document.getElementById('modelSel');
   sel.innerHTML = '<option value="">— 选择模型 —</option>';
-  cachedModels.forEach(m => sel.add(new Option(m.name, m.id)));
+  cachedModels.forEach(m => {
+    const label = m.id === 'openrouter/free' ? '🌐 ' + m.name + '（免费 router）' : m.name;
+    sel.add(new Option(label, m.id));
+  });
 }
 
 async function doSend() {
@@ -314,9 +350,15 @@ async function doSend() {
   const meta = document.getElementById('testMeta');
   btn.disabled = true; btn.textContent = '⏳…';
   out.textContent = ''; out.className = ''; meta.textContent = '';
+  // 自动识别：选中的模型在缓存列表里即自动走免费路由
+  const isCachedModel = cachedModels.some(m => m.id === model);
+  const headers = {'Content-Type':'application/json'};
+  if (isCachedModel) headers['X-ORProxy-Free'] = '1';
+  const hint = document.getElementById('testHint');
+  hint.style.display = isCachedModel ? 'block' : 'none';
   try {
     const r = await fetch(base + '/v1/chat/completions', {
-      method: 'POST', headers: {'Content-Type':'application/json'},
+      method: 'POST', headers,
       body: JSON.stringify({model, messages:[{role:'user',content:prompt}], max_tokens:500})
     });
     const text = await r.text();
@@ -365,6 +407,49 @@ async function poll() {
   }
 }
 
+// ===== 配置文件编辑 =====
+async function openConfigModal() {
+  document.getElementById('cfgResult').textContent = '';
+  document.getElementById('cfgResult').className = 'result';
+  try {
+    const r = await fetch(base + '/config');
+    const d = await r.json();
+    document.getElementById('cfgEditPath').textContent = d.path || '';
+    document.getElementById('cfgEditor').value = d.content || '';
+    document.getElementById('cfgModal').classList.add('open');
+    setTimeout(() => document.getElementById('cfgEditor').focus(), 50);
+  } catch(e) {
+    alert('读取配置失败: ' + e.message);
+  }
+}
+function closeConfigModal() {
+  document.getElementById('cfgModal').classList.remove('open');
+}
+async function saveConfig() {
+  const content = document.getElementById('cfgEditor').value;
+  const result = document.getElementById('cfgResult');
+  result.textContent = '保存中…';
+  result.className = 'result';
+  try {
+    const r = await fetch(base + '/config/save', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({content})
+    });
+    const d = await r.json();
+    if (d.ok) {
+      result.textContent = '✅ ' + d.message;
+      result.className = 'result ok';
+    } else {
+      result.textContent = '❌ ' + (d.error?.message || '保存失败');
+      result.className = 'result err';
+    }
+  } catch(e) {
+    result.textContent = '❌ ' + e.message;
+    result.className = 'result err';
+  }
+}
+
 // ===== 页面生命周期 =====
 window.addEventListener('beforeunload', () => {
   if (navigator.sendBeacon) navigator.sendBeacon(base + '/page-closed');
@@ -376,5 +461,25 @@ connectLogs();
 loadKeys(); loadModels(); poll();
 setInterval(poll, 10000);
 </script>
+
+<!-- 配置文件编辑模态框 -->
+<div id="cfgModal" class="modal-overlay" onclick="if(event.target===this)closeConfigModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>📝 配置文件</h3>
+      <button class="modal-close" onclick="closeConfigModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="cfg-edit-path" id="cfgEditPath"></div>
+      <textarea id="cfgEditor" spellcheck="false"></textarea>
+    </div>
+    <div class="modal-footer">
+      <span class="result" id="cfgResult"></span>
+      <button onclick="closeConfigModal()">取消</button>
+      <button class="primary" onclick="saveConfig()">💾 保存</button>
+    </div>
+  </div>
+</div>
+</body>
 </body>
 </html>
