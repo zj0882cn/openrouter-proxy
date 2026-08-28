@@ -1,0 +1,1024 @@
+// proxy.go - OpenRouter 本地多账号代理（Go 版本）
+// 交叉编译：GOOS=windows GOARCH=amd64 go build proxy.go
+//           GOOS=linux GOARCH=amd64 go build proxy.go
+package main
+
+import (
+	"bytes"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ============ Key 管理器 ============
+type keyManager struct {
+	mu         sync.RWMutex
+	pausedKeys map[string]bool // key前12位 -> true
+}
+
+func newKeyManager() *keyManager {
+	return &keyManager{pausedKeys: make(map[string]bool)}
+}
+
+func (km *keyManager) isPaused(key string) bool {
+	km.mu.RLock()
+	defer km.mu.RUnlock()
+	return km.pausedKeys[key[:min(12, len(key))]]
+}
+
+func (km *keyManager) pause(key string) {
+	km.mu.Lock()
+	defer km.mu.Unlock()
+	km.pausedKeys[key[:min(12, len(key))]] = true
+}
+
+func (km *keyManager) resume(key string) {
+	km.mu.Lock()
+	defer km.mu.Unlock()
+	delete(km.pausedKeys, key[:min(12, len(key))])
+}
+
+func (km *keyManager) getPausedCount() int {
+	km.mu.RLock()
+	defer km.mu.RUnlock()
+	return len(km.pausedKeys)
+}
+
+//go:embed proxy-dashboard.html
+var dashboardHTML embed.FS
+
+// ============ 配置 ============
+const (
+	defaultPort    = "8787"
+	defaultCreds   = "credentials.yaml"  // 相对路径：exe 同目录，Windows/Linux 通用
+	defaultUpstream = "openrouter.ai"
+	defaultBind     = "127.0.0.1"         // 远程访问时设为 0.0.0.0
+	refreshInterval = 15 * time.Minute    // 免费模型刷新间隔
+)
+
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// ============ 日志 ============
+var (
+	logger   *log.Logger
+	logMutex sync.Mutex
+)
+
+func init() {
+	logger = log.New(os.Stdout, "", 0)
+}
+
+func nowTs() string {
+	return time.Now().In(time.FixedZone("CST", 8*3600)).Format("15:04:05")
+}
+
+func logf(format string, v ...interface{}) {
+	msg := fmt.Sprintf(format, v...)
+	line := fmt.Sprintf("[%s] %s", nowTs(), msg)
+	logMutex.Lock()
+	logger.Print(line)
+	logMutex.Unlock()
+}
+
+// ============ 凭据解析 ============
+type keyEntry struct {
+	envName string
+	key     string
+	slot    string
+}
+
+func loadKeys(credPath string) ([]keyEntry, error) {
+	data, err := os.ReadFile(credPath)
+	if err != nil {
+		return nil, fmt.Errorf("读凭据文件失败: %w", err)
+	}
+
+	var keys []keyEntry
+	re := regexp.MustCompile(`(?m)^\s*(OPENROUTER(\d*)_API_KEY)\s*:\s*(\S+)`)
+	matches := re.FindAllSubmatch(data, -1)
+	for _, m := range matches {
+		envName := string(m[1])
+		slot := string(m[2])
+		key := string(m[3])
+		keys = append(keys, keyEntry{envName: envName, key: key, slot: slot})
+	}
+
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].envName == "OPENROUTER_API_KEY" {
+			return true
+		}
+		if keys[j].envName == "OPENROUTER_API_KEY" {
+			return false
+		}
+		return keys[i].slot < keys[j].slot
+	})
+
+	return keys, nil
+}
+
+func maskKey(k string) string {
+	if len(k) < 6 {
+		return "***"
+	}
+	return k[len(k)-6:]
+}
+
+// ============ 冷却管理 ============
+type cooldownMgr struct {
+	mu       sync.RWMutex
+	coolings map[string]time.Time
+}
+
+func newCooldownMgr() *cooldownMgr {
+	return &cooldownMgr{coolings: make(map[string]time.Time)}
+}
+
+func (c *cooldownMgr) isCooling(envName string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if t, ok := c.coolings[envName]; ok {
+		return time.Now().Before(t)
+	}
+	return false
+}
+
+func (c *cooldownMgr) setCooling(envName string, until time.Time) {
+	c.mu.Lock()
+	c.coolings[envName] = until
+	c.mu.Unlock()
+}
+
+func (c *cooldownMgr) readyKeys(keys []keyEntry) ([]keyEntry, string) {
+	var ready []keyEntry
+	for _, k := range keys {
+		if !c.isCooling(k.envName) {
+			ready = append(ready, k)
+		}
+	}
+	if len(ready) > 0 {
+		return ready, ""
+	}
+	soonest := keys[0]
+	minTs := time.Now().Add(100 * time.Hour)
+	for _, k := range keys {
+		c.mu.RLock()
+		if t, ok := c.coolings[k.envName]; ok && t.Before(minTs) {
+			minTs = t
+			soonest = k
+		}
+		c.mu.RUnlock()
+	}
+	return []keyEntry{soonest}, "all-cooling"
+}
+
+func parseCooldown(resp *http.Response, body []byte) time.Duration {
+	if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
+		if ts, err := strconv.ParseFloat(reset, 64); err == nil {
+			if ts > 1e12 {
+				ts /= 1000
+			}
+			t := time.Unix(int64(ts), 0)
+			if t.After(time.Now()) {
+				return time.Until(t) + 30*time.Second
+			}
+		}
+	}
+	var j struct {
+		Error struct {
+			Metadata struct {
+				Headers struct {
+					XRateLimitReset string `json:"X-RateLimit-Reset"`
+				} `json:"headers"`
+			} `json:"metadata"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &j) == nil && j.Error.Metadata.Headers.XRateLimitReset != "" {
+		if ts, err := strconv.ParseFloat(j.Error.Metadata.Headers.XRateLimitReset, 64); err == nil {
+			if ts > 1e12 {
+				ts /= 1000
+			}
+			t := time.Unix(int64(ts), 0)
+			if t.After(time.Now()) {
+				return time.Until(t) + 30*time.Second
+			}
+		}
+	}
+	return 90 * time.Second
+}
+
+// ============ 状态追踪 ============
+type state struct {
+	mu       sync.RWMutex
+	lastGood string
+}
+
+func newState() *state { return &state{} }
+
+func (s *state) setLastGood(envName string) {
+	s.mu.Lock()
+	s.lastGood = envName
+	s.mu.Unlock()
+}
+
+func (s *state) rotateStart(keys []keyEntry) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastGood == "" {
+		return 0
+	}
+	for i, k := range keys {
+		if k.envName == s.lastGood {
+			return (i + 1) % len(keys)
+		}
+	}
+	return 0
+}
+
+// ============ 免费模型缓存 ============
+type FreeModel struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	ContextLength int    `json:"context_length"`
+}
+
+func isFreeModel(m map[string]interface{}) bool {
+	pricing, ok := m["pricing"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	promptStr := fmt.Sprintf("%v", pricing["prompt"])
+	compStr := fmt.Sprintf("%v", pricing["completion"])
+	return promptStr == "0" && compStr == "0"
+}
+
+type freeModelsCache struct {
+	mu         sync.RWMutex
+	models     []FreeModel
+	lastUpdate time.Time
+	fetchErr   error
+}
+
+func newFreeModelsCache() *freeModelsCache {
+	return &freeModelsCache{}
+}
+
+func (c *freeModelsCache) fetch(key string) {
+	upstreamURL := "https://openrouter.ai/api/v1/models"
+	req, err := http.NewRequest(http.MethodGet, upstreamURL, nil)
+	if err != nil {
+		c.mu.Lock()
+		c.fetchErr = err
+		c.mu.Unlock()
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("User-Agent", "OpenRouter-Go-Proxy/1.0")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.mu.Lock()
+		c.fetchErr = fmt.Errorf("network error: %w", err)
+		c.mu.Unlock()
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.mu.Lock()
+		c.fetchErr = fmt.Errorf("read error: %w", err)
+		c.mu.Unlock()
+		return
+	}
+
+	var j struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &j); err != nil {
+		c.mu.Lock()
+		c.fetchErr = fmt.Errorf("parse error: %w", err)
+		c.mu.Unlock()
+		return
+	}
+
+	var free []FreeModel
+	for _, m := range j.Data {
+		if !isFreeModel(m) {
+			continue
+		}
+		name, _ := m["name"].(string)
+		id, _ := m["id"].(string)
+		ctxLen := 0
+		if cl, ok := m["context_length"].(float64); ok {
+			ctxLen = int(cl)
+		}
+		free = append(free, FreeModel{
+			ID:            id,
+			Name:          name,
+			ContextLength: ctxLen,
+		})
+	}
+
+	c.mu.Lock()
+	c.models = free
+	c.lastUpdate = time.Now()
+	c.fetchErr = nil
+	c.mu.Unlock()
+
+	logf("🎁 免费模型已刷新: %d 个", len(free))
+}
+
+func (c *freeModelsCache) get() ([]FreeModel, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.models, c.fetchErr == nil
+}
+
+func (c *freeModelsCache) startBackgroundRefresh(key string) {
+	go func() {
+		c.fetch(key)
+		ticker := time.NewTicker(refreshInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			c.fetch(key)
+		}
+	}()
+}
+
+// ============ 心跳检测：页面关闭自动退出 ============
+type heartbeatMgr struct {
+	mu          sync.RWMutex
+	lastBeat    time.Time
+	pageOpen    bool
+	autoExitSec int // 0=不自动退出，正数=超时秒数
+}
+
+func newHeartbeatMgr(autoExitSec int) *heartbeatMgr {
+	return &heartbeatMgr{pageOpen: true, autoExitSec: autoExitSec, lastBeat: time.Now()}
+}
+
+func (h *heartbeatMgr) beat() {
+	h.mu.Lock()
+	h.lastBeat = time.Now()
+	h.pageOpen = true
+	h.mu.Unlock()
+}
+
+func (h *heartbeatMgr) pageClosed() {
+	h.mu.Lock()
+	h.pageOpen = false
+	h.mu.Unlock()
+}
+
+func (h *heartbeatMgr) shouldExit() bool {
+	if h.autoExitSec <= 0 {
+		return false
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if !h.pageOpen {
+		return true // 收到 page-closed 信号
+	}
+	return time.Since(h.lastBeat) > time.Duration(h.autoExitSec)*time.Second
+}
+
+func (h *heartbeatMgr) startMonitor() {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if h.shouldExit() {
+				logf("⏹ 检测到 Dashboard 已关闭，自动退出")
+				os.Exit(0)
+			}
+		}
+	}()
+}
+
+// ============ Handler ============
+type handler struct {
+	upstream    string
+	credPath    string
+	bind        string
+	authToken   string
+	cooldown    *cooldownMgr
+	state       *state
+	freeModels  *freeModelsCache
+	keysMu      sync.Mutex
+	keyManager  *keyManager
+	heartbeat   *heartbeatMgr
+}
+
+func (h *handler) loadKeys() ([]keyEntry, error) {
+	h.keysMu.Lock()
+	defer h.keysMu.Unlock()
+	return loadKeys(h.credPath)
+}
+
+func (h *handler) checkAuth(w http.ResponseWriter, r *http.Request) bool {
+	if h.authToken == "" {
+		return true
+	}
+	host := r.Host
+	if strings.HasPrefix(host, "127.") || host == "localhost" || host == "[::1]" {
+		return true
+	}
+	token := r.Header.Get("X-Auth-Token")
+	if token == h.authToken {
+		return true
+	}
+	if r.URL.Query().Get("token") == h.authToken {
+		return true
+	}
+	http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
+	return false
+}
+
+func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.checkAuth(w, r) {
+		return
+	}
+
+	switch r.URL.Path {
+	case "/":
+		h.serveDashboard(w, r)
+	case "/health":
+		h.serveHealth(w, r)
+	case "/v1/free-models":
+		h.serveFreeModels(w, r)
+	case "/v1/models":
+		h.serveModels(w, r)
+	case "/v1/chat/completions":
+		h.proxyChat(w, r)
+	case "/keys":
+		h.manageKeys(w, r)
+	case "/keys/add":
+		h.addKey(w, r)
+	case "/keys/remove":
+		h.removeKey(w, r)
+	case "/keys/pause":
+		h.pauseKey(w, r)
+	case "/keys/resume":
+		h.resumeKey(w, r)
+	case "/shutdown":
+		h.shutdown(w, r)
+	case "/heartbeat":
+		h.heartbeatHandler(w, r)
+	case "/page-closed":
+		h.pageClosedHandler(w, r)
+	default:
+		http.Error(w, `{"error":{"message":"Not found"}}`, http.StatusNotFound)
+	}
+}
+
+func (h *handler) serveDashboard(w http.ResponseWriter, r *http.Request) {
+	data, err := dashboardHTML.ReadFile("proxy-dashboard.html")
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(200)
+		w.Write([]byte(`<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body><h1>proxy-dashboard.html not found</h1>
+<p>Ensure the HTML file is in the same directory as the proxy binary.</p></body></html>`))
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(200)
+	w.Write(data)
+}
+
+func (h *handler) serveHealth(w http.ResponseWriter, r *http.Request) {
+	keys, err := h.loadKeys()
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	type keyStatus struct {
+		Key          string `json:"key"`
+		CoolingUntil string `json:"cooling_until"`
+	}
+	status := struct {
+		Status   string      `json:"status"`
+		Upstream string      `json:"upstream"`
+		Keys     []keyStatus `json:"keys"`
+	}{
+		Status:   "ok",
+		Upstream: h.upstream,
+		Keys:     []keyStatus{},
+	}
+	for _, k := range keys {
+		ks := keyStatus{Key: fmt.Sprintf("Key%s(%s)", k.slot, maskKey(k.key))}
+		if h.cooldown.isCooling(k.envName) {
+			h.cooldown.mu.RLock()
+			if t, ok := h.cooldown.coolings[k.envName]; ok {
+				ks.CoolingUntil = t.In(time.FixedZone("CST", 8*3600)).Format("15:04:05")
+			}
+			h.cooldown.mu.RUnlock()
+		}
+		status.Keys = append(status.Keys, ks)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+func (h *handler) serveFreeModels(w http.ResponseWriter, r *http.Request) {
+	models, ok := h.freeModels.get()
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(struct {
+			Models []FreeModel `json:"models"`
+			Stale  bool        `json:"stale"`
+		}{Models: models, Stale: true})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(struct {
+		Models []FreeModel `json:"models"`
+		Stale  bool        `json:"stale"`
+	}{Models: models, Stale: false})
+}
+
+// ============ Key 管理 API ============
+// GET  /keys          - 列出所有 Key 状态
+// POST /keys/add       - 添加新 Key（写入 credentials.yaml）
+// POST /keys/remove   - 删除 Key（写入 credentials.yaml）
+// POST /keys/pause    - 暂停 Key（内存态，不写入文件）
+// POST /keys/resume   - 恢复 Key（内存态）
+
+func (h *handler) manageKeys(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":{"message":"GET only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	keys, err := h.loadKeys()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err.Error()), 500)
+		return
+	}
+	type keyInfo struct {
+		Name      string `json:"name"`
+		Mask      string `json:"mask"`
+		Paused    bool   `json:"paused"`
+		Cooling   bool   `json:"cooling"`
+		CoolUntil string `json:"cooling_until,omitempty"`
+	}
+	var list []keyInfo
+	for _, k := range keys {
+		ki := keyInfo{
+			Name:    k.envName,
+			Mask:    maskKey(k.key),
+			Paused:  h.keyManager.isPaused(k.key),
+			Cooling: h.cooldown.isCooling(k.envName),
+		}
+		if ki.Cooling {
+			h.cooldown.mu.RLock()
+			if t, ok := h.cooldown.coolings[k.envName]; ok {
+				ki.CoolUntil = t.In(time.FixedZone("CST", 8*3600)).Format("15:04:05")
+			}
+			h.cooldown.mu.RUnlock()
+		}
+		list = append(list, ki)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"keys": list, "count": len(list)})
+}
+
+func (h *handler) addKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"POST only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		EnvName string `json:"env_name"` // 如 "OPENROUTER5_API_KEY"
+		Key     string `json:"key"`      // sk-or-v1-xxx
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":{"message":"invalid json"}}`, 400)
+		return
+	}
+	if req.EnvName == "" || req.Key == "" {
+		http.Error(w, `{"error":{"message":"env_name and key required"}}`, 400)
+		return
+	}
+	if !strings.HasPrefix(req.Key, "sk-or-v1-") {
+		http.Error(w, `{"error":{"message":"invalid key format, must start with sk-or-v1-"}}`, 400)
+		return
+	}
+
+	h.keysMu.Lock()
+	defer h.keysMu.Unlock()
+
+	data, err := os.ReadFile(h.credPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"cannot read creds: %v"}}`, err), 500)
+		return
+	}
+
+	if strings.Contains(string(data), req.EnvName) {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s already exists"}}`, req.EnvName), 409)
+		return
+	}
+
+	newLine := fmt.Sprintf("\n%s: %s", req.EnvName, req.Key)
+	if err := os.WriteFile(h.credPath, append(data, []byte(newLine)...), 0644); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"write failed: %v"}}`, err), 500)
+		return
+	}
+
+	logf("➕ 添加 Key: %s", req.EnvName)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Key added"})
+}
+
+func (h *handler) removeKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"POST only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		EnvName string `json:"env_name"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":{"message":"invalid json"}}`, 400)
+		return
+	}
+	if req.EnvName == "" {
+		http.Error(w, `{"error":{"message":"env_name required"}}`, 400)
+		return
+	}
+
+	h.keysMu.Lock()
+	defer h.keysMu.Unlock()
+
+	data, err := os.ReadFile(h.credPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"cannot read creds: %v"}}`, err), 500)
+		return
+	}
+
+	pattern := fmt.Sprintf(`(?m)^\s*%s\s*:\s*\S+.*$`, regexp.QuoteMeta(req.EnvName))
+	re := regexp.MustCompile(pattern)
+	newData := re.ReplaceAll(data, nil)
+	if string(newData) == string(data) {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s not found"}}`, req.EnvName), 404)
+		return
+	}
+
+	if err := os.WriteFile(h.credPath, newData, 0644); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"write failed: %v"}}`, err), 500)
+		return
+	}
+
+	logf("🗑️ 删除 Key: %s", req.EnvName)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Key removed"})
+}
+
+func (h *handler) pauseKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"POST only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		Key string `json:"key"` // 完整 key / mask / envName
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":{"message":"invalid json"}}`, 400)
+		return
+	}
+	if req.Key == "" {
+		http.Error(w, `{"error":{"message":"key required"}}`, 400)
+		return
+	}
+
+	keys, err := h.loadKeys()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), 500)
+		return
+	}
+
+	var found string
+	for _, k := range keys {
+		if strings.Contains(k.key, req.Key) || maskKey(k.key) == req.Key || k.envName == req.Key {
+			h.keyManager.pause(k.key)
+			found = k.envName
+			logf("⏸️ 暂停 Key: %s", k.envName)
+			break
+		}
+	}
+
+	if found == "" {
+		http.Error(w, `{"error":{"message":"key not found"}}`, 404)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Key paused", "env_name": found})
+}
+
+func (h *handler) resumeKey(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"POST only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	body, _ := io.ReadAll(r.Body)
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, `{"error":{"message":"invalid json"}}`, 400)
+		return
+	}
+	if req.Key == "" {
+		http.Error(w, `{"error":{"message":"key required"}}`, 400)
+		return
+	}
+
+	keys, err := h.loadKeys()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err), 500)
+		return
+	}
+
+	var found string
+	for _, k := range keys {
+		if strings.Contains(k.key, req.Key) || maskKey(k.key) == req.Key || k.envName == req.Key {
+			h.keyManager.resume(k.key)
+			found = k.envName
+			logf("▶️ 恢复 Key: %s", k.envName)
+			break
+		}
+	}
+
+	if found == "" {
+		http.Error(w, `{"error":{"message":"key not found"}}`, 404)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Key resumed", "env_name": found})
+}
+
+// ============ 关闭程序 ============
+func (h *handler) shutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":{"message":"POST only"}}`, http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	w.Write([]byte(`{"status":"shutting down"}`))
+
+	logf("⏹ 收到关闭请求，3秒后退出…")
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	go func() {
+		time.Sleep(3 * time.Second)
+		os.Exit(0)
+	}()
+}
+
+func (h *handler) heartbeatHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		// SSE: 持续推送心跳，保持连接
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(200)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		// 先发一次
+		now := time.Now().In(time.FixedZone("CST", 8*3600)).Format("15:04:05")
+		fmt.Fprintf(w, "data: %s\n\n", now)
+		flusher.Flush()
+		for range ticker.C {
+			now := time.Now().In(time.FixedZone("CST", 8*3600)).Format("15:04:05")
+			fmt.Fprintf(w, "data: %s\n\n", now)
+			flusher.Flush()
+		}
+		return
+	}
+	// POST: 接收心跳
+	h.heartbeat.beat()
+	w.WriteHeader(200)
+	w.Write([]byte(`{}`))
+}
+
+func (h *handler) pageClosedHandler(w http.ResponseWriter, r *http.Request) {
+	h.heartbeat.pageClosed()
+	w.WriteHeader(200)
+	w.Write([]byte(`{}`))
+}
+
+func (h *handler) serveModels(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.doUpstream("", http.MethodGet, "/v1/models", nil)
+	if err != nil {
+		http.Error(w, err.Error(), 502)
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	h.copyResponse(w, resp, body)
+}
+
+func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"failed to read body"}}`, 400)
+		return
+	}
+
+	keys, err := h.loadKeys()
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err.Error()), 500)
+		return
+	}
+
+	start := h.state.rotateStart(keys)
+	rotated := append(keys[start:], keys[:start]...)
+	ready, note := h.cooldown.readyKeys(rotated)
+
+	for i, k := range ready {
+		if h.keyManager.isPaused(k.key) {
+			logf("⏸️ %s 已暂停，跳过", maskKey(k.key))
+			continue
+		}
+		if i > 0 || note == "all-cooling" {
+			logf("⚠️ %s", note)
+		}
+
+		start := time.Now()
+		resp, err := h.doUpstream(k.key, http.MethodPost, "/v1/chat/completions", body)
+		elapsed := time.Since(start)
+
+		if err != nil {
+			logf("❌ %s 网络错误: %v", maskKey(k.key), err)
+			continue
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		statusCode := resp.StatusCode
+
+		if statusCode == 200 {
+			h.state.setLastGood(k.envName)
+			logf("✅ %s 成功 (%.1fs)", maskKey(k.key), elapsed.Seconds())
+			h.copyResponse(w, resp, respBody)
+			return
+		}
+
+		if statusCode == 429 {
+			coolDur := parseCooldown(resp, respBody)
+			until := time.Now().Add(coolDur)
+			h.cooldown.setCooling(k.envName, until)
+			logf("🔁 %s 429 → 冷却 %.0f分钟，换下一条", maskKey(k.key), coolDur.Minutes())
+			continue
+		}
+
+		if statusCode == 402 || statusCode == 403 {
+			logf("⛔ %s %d 模型需付费额度，跳过此线（不冷却）", maskKey(k.key), statusCode)
+			continue
+		}
+
+		detail := string(respBody)
+		if len(detail) > 80 {
+			detail = detail[:80] + "..."
+		}
+		logf("❌ %s HTTP %d: %s", maskKey(k.key), statusCode, detail)
+		if i == len(ready)-1 {
+			h.copyResponse(w, resp, respBody)
+			return
+		}
+	}
+
+	http.Error(w, `{"error":{"message":"all keys exhausted"}}`, 502)
+}
+
+func (h *handler) doUpstream(key, method, path string, body []byte) (*http.Response, error) {
+	upstreamPath := path
+	if strings.HasPrefix(path, "/v1") {
+		upstreamPath = "/api" + path
+	}
+
+	upstreamURL := fmt.Sprintf("https://%s%s", h.upstream, upstreamPath)
+	req, err := http.NewRequest(method, upstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "OpenRouter-Go-Proxy/1.0")
+	}
+
+	client := &http.Client{Timeout: 180 * time.Second}
+	return client.Do(req)
+}
+
+func (h *handler) copyResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
+	w.WriteHeader(resp.StatusCode)
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Write(body)
+}
+
+// ============ 入口 ============
+func main() {
+	port := env("PROXY_PORT", defaultPort)
+	credPath := env("CREDS_PATH", defaultCreds)
+	upstream := env("UPSTREAM_HOST", defaultUpstream)
+	bind := env("BIND_ADDR", defaultBind)
+	authToken := env("AUTH_TOKEN", "")
+	autoExitSec := 0
+	if v := os.Getenv("AUTO_EXIT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			autoExitSec = n
+		}
+	}
+
+	if !filepath.IsAbs(credPath) {
+		execPath, _ := os.Executable()
+		if execPath != "" {
+			credPath = filepath.Join(filepath.Dir(execPath), credPath)
+		}
+	}
+
+	if _, err := os.Stat(credPath); os.IsNotExist(err) {
+		logf("⚠️ 凭据文件不存在: %s，将无法加载 Key", credPath)
+	}
+
+	h := &handler{
+		upstream:   upstream,
+		credPath:   credPath,
+		bind:       bind,
+		authToken:  authToken,
+		cooldown:   newCooldownMgr(),
+		state:      newState(),
+		freeModels: newFreeModelsCache(),
+		keyManager: newKeyManager(),
+		heartbeat:  newHeartbeatMgr(autoExitSec),
+	}
+
+	keys, err := loadKeys(credPath)
+	if err == nil && len(keys) > 0 {
+		h.freeModels.startBackgroundRefresh(keys[0].key)
+	} else {
+		logf("⚠️ 无可用 Key，免费模型刷新跳过")
+	}
+
+	if autoExitSec > 0 {
+		h.heartbeat.startMonitor()
+		logf("💓 心跳检测已开启，Dashboard 关闭后 %d 秒自动退出", autoExitSec)
+	}
+
+	addr := fmt.Sprintf("%s:%s", bind, port)
+	scheme := "http"
+	if bind != "127.0.0.1" && bind != "localhost" && bind != "[::1]" {
+		scheme = "🔓 http(远程开放)"
+	}
+	logf("🚀 启动: %s://%s → https://%s", scheme, addr, upstream)
+	logf("📄 凭据: %s", credPath)
+	logf("🩺 健康: http://%s/health", addr)
+	logf("📊 面板: http://%s/", addr)
+	if authToken != "" {
+		logf("🔐 远程认证: X-Auth-Token header 或 ?token= query")
+	}
+
+	server := &http.Server{
+		Addr:    addr,
+		Handler: h,
+	}
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("服务器错误: %v", err)
+	}
+}
