@@ -272,7 +272,7 @@ func (c *cooldownMgr) readyKeys(keys []keyEntry) ([]keyEntry, string) {
 	return []keyEntry{soonest}, "all-cooling"
 }
 
-func parseCooldown(resp *http.Response, body []byte) time.Duration {
+func (h *handler) parseCooldown(resp *http.Response, body []byte) time.Duration {
 	if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
 		if ts, err := strconv.ParseFloat(reset, 64); err == nil {
 			if ts > 1e12 {
@@ -304,7 +304,47 @@ func parseCooldown(resp *http.Response, body []byte) time.Duration {
 			}
 		}
 	}
-	return 90 * time.Second
+	return time.Duration(h.retry.Cooldown429Sec) * time.Second
+}
+
+// waitForKey 等待直到至少有一个 key 脱离冷却,或超过 maxSec
+// 模仿 DSH proxy.py 的 wait_for_key():轮询 readyKeys(),全部冷却时 sleep WaitRetrySec
+func (h *handler) waitForKey(keys []keyEntry, maxSec int) ([]keyEntry, string) {
+	if maxSec <= 0 {
+		maxSec = h.retry.WaitMaxSec
+	}
+	deadline := time.Now().Add(time.Duration(maxSec) * time.Second)
+	for {
+		ready, note := h.cooldown.readyKeys(keys)
+		if note != "all-cooling" && len(ready) > 0 {
+			return ready, note
+		}
+		if time.Now().After(deadline) {
+			return ready, note // 返回 all-cooling 状态,由调用方决定是否重试
+		}
+		time.Sleep(time.Duration(h.retry.WaitRetrySec) * time.Second)
+	}
+}
+
+// perKeyDelay 控制同一 key 的调用间隔(per-key rate limit)
+// DSH 策略:每把 key 调用后强制 sleep 2s,避免触发 OpenRouter 5s/req 单 key 限制
+func (h *handler) perKeyDelay(envName string) {
+	if h.retry.PerKeyDelaySec <= 0 {
+		return
+	}
+	h.lastCallMu.Lock()
+	last := h.lastCall[envName]
+	need := time.Duration(h.retry.PerKeyDelaySec) * time.Second
+	if !last.IsZero() {
+		elapsed := time.Since(last)
+		if elapsed < need {
+			h.lastCallMu.Unlock()
+			time.Sleep(need - elapsed)
+			h.lastCallMu.Lock()
+		}
+	}
+	h.lastCall[envName] = time.Now()
+	h.lastCallMu.Unlock()
 }
 
 // ============ 状态追踪 ============
@@ -509,6 +549,32 @@ func (h *heartbeatMgr) startMonitor() {
 }
 
 // ============ Handler ============
+type RetryConfig struct {
+	Cooldown429Sec   int
+	Cooldown401Sec   int
+	Cooldown403Sec   int
+	PerKeyDelaySec   int
+	WaitRetrySec     int
+	WaitMaxSec       int
+	FallbackRetrySec int
+	FallbackMaxSec   int
+	BetweenRoundsSec int
+}
+
+func defaultRetryConfig() RetryConfig {
+	return RetryConfig{
+		Cooldown429Sec:   10,
+		Cooldown401Sec:   86400,
+		Cooldown403Sec:   3600,
+		PerKeyDelaySec:   2,
+		WaitRetrySec:     3,
+		WaitMaxSec:       30,
+		FallbackRetrySec: 3,
+		FallbackMaxSec:   60,
+		BetweenRoundsSec: 10,
+	}
+}
+
 type handler struct {
 	upstream    string
 	credPath    string
@@ -522,6 +588,9 @@ type handler struct {
 	heartbeat   *heartbeatMgr
 	configPath  string
 	configMu    sync.Mutex // 保护 bind/authToken/upstream 等运行时热更新的字段
+	retry       RetryConfig
+	lastCallMu  sync.Mutex
+	lastCall    map[string]time.Time // per-key 上次调用时刻（限速用）
 }
 
 func (h *handler) loadKeys() ([]keyEntry, error) {
@@ -1139,6 +1208,18 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 	fallbackDone := false
 
 	tryProxy := func(body []byte, modelName string, isFreeRouter bool) bool {
+		// all-cooling 时等待 key 恢复(DSH wait_for_key 策略)
+		if note == "all-cooling" {
+			logf("⚠️ [%s] 所有 key 均冷却中，等待恢复 (wait_max=%ds)...", modelName, h.retry.WaitMaxSec)
+			var waitNote string
+			ready, waitNote = h.waitForKey(rotated, h.retry.WaitMaxSec)
+			if len(ready) == 0 {
+				logf("⚠️ [%s] 等待超时(all-cooling)，继续尝试最后一把 key", modelName)
+			} else {
+				logf("✅ [%s] %s", modelName, waitNote)
+			}
+		}
+
 		for i, k := range ready {
 			if h.keyManager.isPaused(k.key) {
 				logf("⏸️ [%s] %s 已暂停，跳过", modelName, fingerprintKey(k.key))
@@ -1147,6 +1228,9 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 			if i > 0 || note == "all-cooling" {
 				logf("⚠️ [%s] %s", modelName, note)
 			}
+
+			// DSH: per-key rate limit — 调用前强制 sleep 间隔
+			h.perKeyDelay(k.envName)
 
 			reqStart := time.Now()
 			resp, err := h.doUpstream(k.key, http.MethodPost, "/v1/chat/completions", body)
@@ -1175,7 +1259,7 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if statusCode == 429 {
-				coolDur := parseCooldown(resp, respBody)
+				coolDur := h.parseCooldown(resp, respBody)
 				until := time.Now().Add(coolDur)
 				h.cooldown.setCooling(k.envName, until)
 				logf("🔁 [%s] %s 429 → 冷却%.0f分钟，换下一条 [%s]",
@@ -1183,9 +1267,21 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			if statusCode == 401 {
+				// 401: key 无效/被删除，24h 冷却
+				coolDur := time.Duration(h.retry.Cooldown401Sec) * time.Second
+				h.cooldown.setCooling(k.envName, time.Now().Add(coolDur))
+				logf("⛔ [%s] %s 401 → 冷却%.0f小时 [%s]",
+					modelName, fingerprintKey(k.key), coolDur.Hours(), k.envName)
+				continue
+			}
+
 			if statusCode == 402 || statusCode == 403 {
-				logf("⛔ [%s] %s %d 付费额度不足，跳过 [%s]",
-					modelName, fingerprintKey(k.key), statusCode, k.envName)
+				// 402/403: 付费额度不足，1h 冷却（402 沿用 skip 不再等待，直接跳过）
+				coolDur := time.Duration(h.retry.Cooldown403Sec) * time.Second
+				h.cooldown.setCooling(k.envName, time.Now().Add(coolDur))
+				logf("⛔ [%s] %s %d 付费额度不足，冷却%.0f分钟 [%s]",
+					modelName, fingerprintKey(k.key), statusCode, coolDur.Minutes(), k.envName)
 				continue
 			}
 
@@ -1209,13 +1305,35 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			return
 		}
-		// 免费路由全部失败 → fallback 原始模型
+		// 免费路由全部失败 → fallback 原始模型（带重试循环）
 		if !fallbackDone {
 			fallbackDone = true
-			logf("🔄 免费路由全部失败，fallback 到原始模型: %s", origModelName)
-			ok = tryProxy(originalBody, origModelName, false)
-			if ok {
-				return
+			logf("🔄 免费路由全部失败，fallback 到原始模型: %s (max=%ds, retry=%ds)",
+				origModelName, h.retry.FallbackMaxSec, h.retry.FallbackRetrySec)
+			// 轮间 sleep：让前面免费路由的 429 冷却有时间恢复
+			if h.retry.BetweenRoundsSec > 0 {
+				logf("⏳ 轮间 sleep %ds...", h.retry.BetweenRoundsSec)
+				time.Sleep(time.Duration(h.retry.BetweenRoundsSec) * time.Second)
+			}
+			deadline := time.Now().Add(time.Duration(h.retry.FallbackMaxSec) * time.Second)
+			for round := 1; ; round++ {
+				// 重新 rotate + 取 ready keys（冷却状态已变化）
+				start := h.state.rotateStart(keys)
+				rotated := append(keys[start:], keys[:start]...)
+				ready, note = h.cooldown.readyKeys(rotated)
+				if note == "all-cooling" {
+					// 全部还在冷却:waitForKey 轮询
+					logf("⏳ [fallback round %d] %s，等待 key 恢复...", round, note)
+				}
+				if tryProxy(originalBody, origModelName, false) {
+					return
+				}
+				if time.Now().After(deadline) {
+					logf("⏱️ [fallback] 已达最大重试 %ds，放弃", h.retry.FallbackMaxSec)
+					break
+				}
+				logf("⏳ [fallback round %d] 全部失败，%ds 后重试...", round, h.retry.FallbackRetrySec)
+				time.Sleep(time.Duration(h.retry.FallbackRetrySec) * time.Second)
 			}
 		}
 	} else {
@@ -1326,6 +1444,16 @@ type AppConfig struct {
 	AutoExitSec      int    `yaml:"auto_exit_sec"`
 	AuthToken        string `yaml:"auth_token"`
 	CredsPath        string `yaml:"creds_path"`
+	// 轮询 / 冷却 / 重试延时（秒）
+	Cooldown429Sec   int `yaml:"cooldown_429_sec"`    // 429 冷却秒数（默认 10）
+	Cooldown401Sec   int `yaml:"cooldown_401_sec"`    // 401 冷却秒数（默认 86400）
+	Cooldown403Sec   int `yaml:"cooldown_403_sec"`    // 403 冷却秒数（默认 3600）
+	PerKeyDelaySec   int `yaml:"per_key_delay_sec"`   // per-key 调用间隔秒数（默认 2）
+	WaitRetrySec     int `yaml:"wait_retry_sec"`      // 全 Key 冷却时重试间隔秒数（默认 3）
+	WaitMaxSec       int `yaml:"wait_max_sec"`        // GET 路径最大等待秒数（默认 30）
+	FallbackRetrySec int `yaml:"fallback_retry_sec"`  // fallback 轮询间重试间隔秒数（默认 3）
+	FallbackMaxSec   int `yaml:"fallback_max_sec"`    // fallback 最大超时秒数（默认 60）
+	BetweenRoundsSec int `yaml:"between_rounds_sec"`  // 两轮之间 sleep 秒数（默认 10）
 }
 
 var defaultConfigYAML = `# ORProxy 配置文件
@@ -1352,6 +1480,26 @@ auth_token: ""
 
 # 凭据文件路径（Key 列表，与配置文件分离）
 creds_path: "orproxy-creds.yaml"
+
+# ===== 重试/限速参数（DSH 策略，全部可调） =====
+# 429 冷却（秒），OpenRouter 触发的限流通常 5~15s 恢复
+cooldown_429_sec: 10
+# 401 冷却（秒），key 无效/被删除 → 24h
+cooldown_401_sec: 86400
+# 403/402 冷却（秒），付费额度不足 → 1h
+cooldown_403_sec: 3600
+# 同一 key 最小调用间隔（秒），DSH 策略：避免单 key 超过 5req/s
+per_key_delay_sec: 2
+# 全部冷却时重试间隔（秒）
+wait_retry_sec: 3
+# 全部冷却时最大等待（秒）
+wait_max_sec: 30
+# fallback 轮询间隔（秒）
+fallback_retry_sec: 3
+# fallback 最大总超时（秒），超过后 502
+fallback_max_sec: 60
+# 两轮重试间 sleep（秒），让 429 冷却恢复
+between_rounds_sec: 10
 `
 
 func resolvePath(rel string) string {
@@ -1409,6 +1557,34 @@ func loadConfig() AppConfig {
 				}
 				if os.Getenv("CREDS_PATH") == "" && fileCfg.CredsPath != "" {
 					cfg.CredsPath = fileCfg.CredsPath
+				}
+				// 9 个延时字段:yaml 优先级 > default (无需 env 覆盖,这些参数测试期不需 env)
+				if fileCfg.Cooldown429Sec > 0 {
+					cfg.Cooldown429Sec = fileCfg.Cooldown429Sec
+				}
+				if fileCfg.Cooldown401Sec > 0 {
+					cfg.Cooldown401Sec = fileCfg.Cooldown401Sec
+				}
+				if fileCfg.Cooldown403Sec > 0 {
+					cfg.Cooldown403Sec = fileCfg.Cooldown403Sec
+				}
+				if fileCfg.PerKeyDelaySec > 0 {
+					cfg.PerKeyDelaySec = fileCfg.PerKeyDelaySec
+				}
+				if fileCfg.WaitRetrySec > 0 {
+					cfg.WaitRetrySec = fileCfg.WaitRetrySec
+				}
+				if fileCfg.WaitMaxSec > 0 {
+					cfg.WaitMaxSec = fileCfg.WaitMaxSec
+				}
+				if fileCfg.FallbackRetrySec > 0 {
+					cfg.FallbackRetrySec = fileCfg.FallbackRetrySec
+				}
+				if fileCfg.FallbackMaxSec > 0 {
+					cfg.FallbackMaxSec = fileCfg.FallbackMaxSec
+				}
+				if fileCfg.BetweenRoundsSec > 0 {
+					cfg.BetweenRoundsSec = fileCfg.BetweenRoundsSec
 				}
 			}
 		}
@@ -1503,6 +1679,20 @@ OPENROUTER_API_KEY: sk-or-v1-YOUR_KEY_HERE
 		keyManager: newKeyManager(),
 		heartbeat:  newHeartbeatMgr(cfg.AutoExitSec),
 		configPath: resolvePath(env("CONFIG_PATH", defaultConfigFile)),
+		retry: func() RetryConfig {
+			rc := defaultRetryConfig()
+			if cfg.Cooldown429Sec > 0   { rc.Cooldown429Sec = cfg.Cooldown429Sec }
+			if cfg.Cooldown401Sec > 0   { rc.Cooldown401Sec = cfg.Cooldown401Sec }
+			if cfg.Cooldown403Sec > 0   { rc.Cooldown403Sec = cfg.Cooldown403Sec }
+			if cfg.PerKeyDelaySec > 0   { rc.PerKeyDelaySec = cfg.PerKeyDelaySec }
+			if cfg.WaitRetrySec > 0     { rc.WaitRetrySec = cfg.WaitRetrySec }
+			if cfg.WaitMaxSec > 0       { rc.WaitMaxSec = cfg.WaitMaxSec }
+			if cfg.FallbackRetrySec > 0 { rc.FallbackRetrySec = cfg.FallbackRetrySec }
+			if cfg.FallbackMaxSec > 0   { rc.FallbackMaxSec = cfg.FallbackMaxSec }
+			if cfg.BetweenRoundsSec > 0 { rc.BetweenRoundsSec = cfg.BetweenRoundsSec }
+			return rc
+		}(),
+		lastCall: make(map[string]time.Time),
 	}
 
 	keys, err := loadKeys(credPath)
