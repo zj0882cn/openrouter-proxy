@@ -1,6 +1,6 @@
-// proxy.go - OpenRouter 本地多账号代理（Go 版本）
-// 交叉编译：GOOS=windows GOARCH=amd64 go build proxy.go
-//           GOOS=linux GOARCH=amd64 go build proxy.go
+// orproxy.go - OpenRouter 本地多账号代理（Go 版本）
+// 交叉编译：GOOS=windows GOARCH=amd64 go build -o orproxy.exe orproxy.go
+//           GOOS=linux   GOARCH=amd64 go build -o orproxy orproxy.go
 package main
 
 import (
@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // ============ Key 管理器 ============
@@ -55,16 +57,18 @@ func (km *keyManager) getPausedCount() int {
 	return len(km.pausedKeys)
 }
 
-//go:embed proxy-dashboard.html
+//go:embed orproxy-dashboard.html
 var dashboardHTML embed.FS
 
 // ============ 配置 ============
 const (
-	defaultPort    = "8787"
-	defaultCreds   = "credentials.yaml"  // 相对路径：exe 同目录，Windows/Linux 通用
+	defaultPort     = "8787"
+	defaultBind     = "127.0.0.1" // 远程访问时设为 0.0.0.0
 	defaultUpstream = "openrouter.ai"
-	defaultBind     = "127.0.0.1"         // 远程访问时设为 0.0.0.0
-	refreshInterval = 15 * time.Minute    // 免费模型刷新间隔
+	defaultRefreshMin = 15         // 免费模型刷新间隔（分钟）
+	defaultAutoExit   = 0          // 0=不自动退出
+	defaultConfigFile = "orproxy.yaml"       // 主配置
+	defaultCredsFile  = "orproxy-creds.yaml" // 凭据
 )
 
 func env(key, fallback string) string {
@@ -74,7 +78,27 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-// ============ 日志 ============
+// ============ 日志缓冲（支持 SSE 推送）============
+const maxLogLines = 500
+
+type logLine struct {
+	Ts   string `json:"ts"`
+	Msg  string `json:"msg"`
+	Kind string `json:"kind"` // "ok","warn","err","info","req"
+}
+
+type logBuffer struct {
+	mu     sync.RWMutex
+	lines  []logLine
+	sse    map[chan string]struct{}
+	sseMu  sync.Mutex
+}
+
+var globalLog = &logBuffer{
+	lines: make([]logLine, 0, maxLogLines),
+	sse:   make(map[chan string]struct{}),
+}
+
 var (
 	logger   *log.Logger
 	logMutex sync.Mutex
@@ -88,12 +112,72 @@ func nowTs() string {
 	return time.Now().In(time.FixedZone("CST", 8*3600)).Format("15:04:05")
 }
 
+// classify 解析日志消息判断类型（用于前端染色）
+func classify(msg string) string {
+	switch {
+	case strings.HasPrefix(msg, "❌"), strings.HasPrefix(msg, "⛔"):
+		return "err"
+	case strings.HasPrefix(msg, "⚠️"), strings.HasPrefix(msg, "⚠ "):
+		return "warn"
+	case strings.HasPrefix(msg, "✅"), strings.HasPrefix(msg, "✅ "):
+		return "ok"
+	case strings.HasPrefix(msg, "💬"), strings.HasPrefix(msg, "🎁"), strings.HasPrefix(msg, "📄"), strings.HasPrefix(msg, "🚀"), strings.HasPrefix(msg, "🩺"), strings.HasPrefix(msg, "📊"), strings.HasPrefix(msg, "🔐"):
+		return "info"
+	default:
+		return ""
+	}
+}
+
 func logf(format string, v ...interface{}) {
 	msg := fmt.Sprintf(format, v...)
 	line := fmt.Sprintf("[%s] %s", nowTs(), msg)
+	ts := nowTs()
+	kind := classify(msg)
+
+	logLine := logLine{Ts: ts, Msg: msg, Kind: kind}
+
 	logMutex.Lock()
 	logger.Print(line)
 	logMutex.Unlock()
+
+	// 写缓冲
+	globalLog.mu.Lock()
+	globalLog.lines = append(globalLog.lines, logLine)
+	if len(globalLog.lines) > maxLogLines {
+		globalLog.lines = globalLog.lines[len(globalLog.lines)-maxLogLines:]
+	}
+	// 推 SSE
+	payload := fmt.Sprintf("event: log\ndata: {\"ts\":\"%s\",\"msg\":%q,\"kind\":\"%s\"}\n\n", ts, msg, kind)
+	globalLog.sseMu.Lock()
+	for ch := range globalLog.sse {
+		select {
+		case ch <- payload:
+		default: // 客户端来不及读则跳过
+		}
+	}
+	globalLog.sseMu.Unlock()
+	globalLog.mu.Unlock()
+}
+
+func (lb *logBuffer) getAll() []logLine {
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+	res := make([]logLine, len(lb.lines))
+	copy(res, lb.lines)
+	return res
+}
+
+func (lb *logBuffer) addSSE(ch chan string) {
+	lb.sseMu.Lock()
+	lb.sse[ch] = struct{}{}
+	lb.sseMu.Unlock()
+}
+
+func (lb *logBuffer) removeSSE(ch chan string) {
+	lb.sseMu.Lock()
+	delete(lb.sse, ch)
+	close(ch)
+	lb.sseMu.Unlock()
 }
 
 // ============ 凭据解析 ============
@@ -133,10 +217,10 @@ func loadKeys(credPath string) ([]keyEntry, error) {
 }
 
 func maskKey(k string) string {
-	if len(k) < 6 {
+	if len(k) < 4 {
 		return "***"
 	}
-	return k[len(k)-6:]
+	return k[len(k)-4:]
 }
 
 // ============ 冷却管理 ============
@@ -351,10 +435,10 @@ func (c *freeModelsCache) get() ([]FreeModel, bool) {
 	return c.models, c.fetchErr == nil
 }
 
-func (c *freeModelsCache) startBackgroundRefresh(key string) {
+func (c *freeModelsCache) startBackgroundRefresh(key string, interval time.Duration) {
 	go func() {
 		c.fetch(key)
-		ticker := time.NewTicker(refreshInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
 			c.fetch(key)
@@ -483,13 +567,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.heartbeatHandler(w, r)
 	case "/page-closed":
 		h.pageClosedHandler(w, r)
+	case "/logs":
+		h.serveLogs(w, r)
 	default:
 		http.Error(w, `{"error":{"message":"Not found"}}`, http.StatusNotFound)
 	}
 }
 
 func (h *handler) serveDashboard(w http.ResponseWriter, r *http.Request) {
-	data, err := dashboardHTML.ReadFile("proxy-dashboard.html")
+	data, err := dashboardHTML.ReadFile("orproxy-dashboard.html")
 	if err != nil {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.WriteHeader(200)
@@ -608,15 +694,15 @@ func (h *handler) addKey(w http.ResponseWriter, r *http.Request) {
 	}
 	body, _ := io.ReadAll(r.Body)
 	var req struct {
-		EnvName string `json:"env_name"` // 如 "OPENROUTER5_API_KEY"
+		EnvName string `json:"env_name"` // 可选；若不提供则自动分配
 		Key     string `json:"key"`      // sk-or-v1-xxx
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		http.Error(w, `{"error":{"message":"invalid json"}}`, 400)
 		return
 	}
-	if req.EnvName == "" || req.Key == "" {
-		http.Error(w, `{"error":{"message":"env_name and key required"}}`, 400)
+	if req.Key == "" {
+		http.Error(w, `{"error":{"message":"key required"}}`, 400)
 		return
 	}
 	if !strings.HasPrefix(req.Key, "sk-or-v1-") {
@@ -627,26 +713,54 @@ func (h *handler) addKey(w http.ResponseWriter, r *http.Request) {
 	h.keysMu.Lock()
 	defer h.keysMu.Unlock()
 
+	// 若未指定 envName，自动分配：OPENROUTER_API_KEY (空) / OPENROUTER2/3/4...
+	envName := req.EnvName
+	if envName == "" {
+		existing, _ := loadKeys(h.credPath)
+		used := make(map[string]bool)
+		maxSlot := 0
+		hasPrimary := false
+		for _, k := range existing {
+			used[k.envName] = true
+			if k.envName == "OPENROUTER_API_KEY" {
+				hasPrimary = true
+				continue
+			}
+			if n, err := strconv.Atoi(k.slot); err == nil && n > maxSlot {
+				maxSlot = n
+			}
+		}
+		if !hasPrimary {
+			envName = "OPENROUTER_API_KEY"
+		} else {
+			envName = fmt.Sprintf("OPENROUTER%d_API_KEY", maxSlot+1)
+		}
+	}
+
 	data, err := os.ReadFile(h.credPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"cannot read creds: %v"}}`, err), 500)
 		return
 	}
 
-	if strings.Contains(string(data), req.EnvName) {
-		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s already exists"}}`, req.EnvName), 409)
+	if strings.Contains(string(data), envName) {
+		http.Error(w, fmt.Sprintf(`{"error":{"message":"%s already exists"}}`, envName), 409)
 		return
 	}
 
-	newLine := fmt.Sprintf("\n%s: %s", req.EnvName, req.Key)
+	newLine := fmt.Sprintf("\n%s: %s", envName, req.Key)
 	if err := os.WriteFile(h.credPath, append(data, []byte(newLine)...), 0644); err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"write failed: %v"}}`, err), 500)
 		return
 	}
 
-	logf("➕ 添加 Key: %s", req.EnvName)
+	logf("➕ 添加 Key: %s", envName)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Key added"})
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":   "ok",
+		"message":  "Key added",
+		"env_name": envName,
+	})
 }
 
 func (h *handler) removeKey(w http.ResponseWriter, r *http.Request) {
@@ -853,6 +967,8 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	modelName := extractModel(body)
+
 	keys, err := h.loadKeys()
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":{"message":"%v"}}`, err.Error()), 500)
@@ -865,19 +981,19 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 
 	for i, k := range ready {
 		if h.keyManager.isPaused(k.key) {
-			logf("⏸️ %s 已暂停，跳过", maskKey(k.key))
+			logf("⏸️ [%s] %s 已暂停，跳过", modelName, maskKey(k.key))
 			continue
 		}
 		if i > 0 || note == "all-cooling" {
-			logf("⚠️ %s", note)
+			logf("⚠️ [%s] %s", modelName, note)
 		}
 
-		start := time.Now()
+		reqStart := time.Now()
 		resp, err := h.doUpstream(k.key, http.MethodPost, "/v1/chat/completions", body)
-		elapsed := time.Since(start)
+		elapsed := time.Since(reqStart)
 
 		if err != nil {
-			logf("❌ %s 网络错误: %v", maskKey(k.key), err)
+			logf("❌ [%s] %s 网络错误: %v", modelName, maskKey(k.key), err)
 			continue
 		}
 
@@ -886,7 +1002,9 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 
 		if statusCode == 200 {
 			h.state.setLastGood(k.envName)
-			logf("✅ %s 成功 (%.1fs)", maskKey(k.key), elapsed.Seconds())
+			tokens := extractTokens(respBody)
+			logf("✅ [%s] %s %s [%.1fs, %s]",
+				modelName, maskKey(k.key), tokens, elapsed.Seconds(), k.envName)
 			h.copyResponse(w, resp, respBody)
 			return
 		}
@@ -895,20 +1013,23 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 			coolDur := parseCooldown(resp, respBody)
 			until := time.Now().Add(coolDur)
 			h.cooldown.setCooling(k.envName, until)
-			logf("🔁 %s 429 → 冷却 %.0f分钟，换下一条", maskKey(k.key), coolDur.Minutes())
+			logf("🔁 [%s] %s 429 → 冷却%.0f分钟，换下一条 [%s]",
+				modelName, maskKey(k.key), coolDur.Minutes(), k.envName)
 			continue
 		}
 
 		if statusCode == 402 || statusCode == 403 {
-			logf("⛔ %s %d 模型需付费额度，跳过此线（不冷却）", maskKey(k.key), statusCode)
+			logf("⛔ [%s] %s %d 付费额度不足，跳过 [%s]",
+				modelName, maskKey(k.key), statusCode, k.envName)
 			continue
 		}
 
 		detail := string(respBody)
-		if len(detail) > 80 {
-			detail = detail[:80] + "..."
+		if len(detail) > 100 {
+			detail = detail[:100] + "..."
 		}
-		logf("❌ %s HTTP %d: %s", maskKey(k.key), statusCode, detail)
+		logf("❌ [%s] %s HTTP %d: %s [%s]",
+			modelName, maskKey(k.key), statusCode, detail, k.envName)
 		if i == len(ready)-1 {
 			h.copyResponse(w, resp, respBody)
 			return
@@ -916,6 +1037,47 @@ func (h *handler) proxyChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, `{"error":{"message":"all keys exhausted"}}`, 502)
+}
+
+// extractModel 从请求体中提取模型名称
+func extractModel(body []byte) string {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "?"
+	}
+	if m, ok := parsed["model"].(string); ok && m != "" {
+		return m
+	}
+	return "?"
+}
+
+// extractTokens 从响应体中提取 token 使用量
+func extractTokens(body []byte) string {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "?"
+	}
+	if usage, ok := parsed["usage"].(map[string]interface{}); ok {
+		p := usage["prompt_tokens"]
+		c := usage["completion_tokens"]
+		t := usage["total_tokens"]
+		return fmt.Sprintf("📥%v 📤%v 📐%v",
+			intOr(p, 0), intOr(c, 0), intOr(t, 0))
+	}
+	return ""
+}
+
+func intOr(v interface{}, def int) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	default:
+		return def
+	}
 }
 
 func (h *handler) doUpstream(key, method, path string, body []byte) (*http.Response, error) {
@@ -952,65 +1114,216 @@ func (h *handler) copyResponse(w http.ResponseWriter, resp *http.Response, body 
 	w.Write(body)
 }
 
-// ============ 入口 ============
-func main() {
-	port := env("PROXY_PORT", defaultPort)
-	credPath := env("CREDS_PATH", defaultCreds)
-	upstream := env("UPSTREAM_HOST", defaultUpstream)
-	bind := env("BIND_ADDR", defaultBind)
-	authToken := env("AUTH_TOKEN", "")
-	autoExitSec := 0
+// ============ 配置加载 ============
+// AppConfig 定义了 orproxy.yaml 的所有可配置项
+type AppConfig struct {
+	Port             string `yaml:"port"`
+	Bind             string `yaml:"bind"`
+	Upstream         string `yaml:"upstream"`
+	RefreshMinutes   int    `yaml:"refresh_minutes"`
+	AutoExitSec      int    `yaml:"auto_exit_sec"`
+	AuthToken        string `yaml:"auth_token"`
+	CredsPath        string `yaml:"creds_path"`
+}
+
+var defaultConfigYAML = `# ORProxy 配置文件
+# 启动时若不存在则自动创建此文件
+# 所有配置项均可通过同名环境变量覆盖（环境变量优先）
+
+# 监听端口
+port: "8787"
+
+# 监听地址（127.0.0.1=仅本机，0.0.0.0=允许远程访问）
+bind: "127.0.0.1"
+
+# 上游服务器（代理目标域名或 IP）
+upstream: "openrouter.ai"
+
+# 免费模型列表刷新间隔（分钟）
+refresh_minutes: 15
+
+# 自动退出：Dashboard 关闭后多少秒退出（0=不自动退出）
+auto_exit_sec: 0
+
+# 远程认证 Token（留空则不认证，支持 header: X-Auth-Token 或 query: ?token=xxx）
+auth_token: ""
+
+# 凭据文件路径（Key 列表，与配置文件分离）
+creds_path: "orproxy-creds.yaml"
+`
+
+func resolvePath(rel string) string {
+	if filepath.IsAbs(rel) {
+		return rel
+	}
+	execPath, _ := os.Executable()
+	if execPath != "" {
+		return filepath.Join(filepath.Dir(execPath), rel)
+	}
+	return rel
+}
+
+func loadConfig() AppConfig {
+	cfg := AppConfig{
+		Port:           env("PROXY_PORT", defaultPort),
+		Bind:           env("BIND_ADDR", defaultBind),
+		Upstream:       env("UPSTREAM_HOST", defaultUpstream),
+		RefreshMinutes: defaultRefreshMin,
+		AutoExitSec:    defaultAutoExit,
+		AuthToken:      env("AUTH_TOKEN", ""),
+		CredsPath:      env("CREDS_PATH", defaultCredsFile),
+	}
+
+	cfgPath := resolvePath(env("CONFIG_PATH", defaultConfigFile))
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		if err := os.WriteFile(cfgPath, []byte(defaultConfigYAML), 0644); err != nil {
+			logf("⚠️ 配置文件不存在，且自动创建失败: %v", err)
+		} else {
+			logf("📄 配置文件不存在，已自动创建: %s\n   ➜ 可编辑此文件调整配置，重启后生效", cfgPath)
+		}
+	} else {
+		data, err := os.ReadFile(cfgPath)
+		if err == nil {
+			var fileCfg AppConfig
+			if err := yaml.Unmarshal(data, &fileCfg); err == nil {
+				// 环境变量已在 cfg 初始化时设置，此处仅在 env 未设置时才用 yaml
+				if os.Getenv("PROXY_PORT") == "" && fileCfg.Port != "" {
+					cfg.Port = fileCfg.Port
+				}
+				if os.Getenv("BIND_ADDR") == "" && fileCfg.Bind != "" {
+					cfg.Bind = fileCfg.Bind
+				}
+				if os.Getenv("UPSTREAM_HOST") == "" && fileCfg.Upstream != "" {
+					cfg.Upstream = fileCfg.Upstream
+				}
+				if fileCfg.RefreshMinutes > 0 {
+					cfg.RefreshMinutes = fileCfg.RefreshMinutes
+				}
+				if fileCfg.AutoExitSec > 0 {
+					cfg.AutoExitSec = fileCfg.AutoExitSec
+				}
+				if os.Getenv("AUTH_TOKEN") == "" && fileCfg.AuthToken != "" {
+					cfg.AuthToken = fileCfg.AuthToken
+				}
+				if os.Getenv("CREDS_PATH") == "" && fileCfg.CredsPath != "" {
+					cfg.CredsPath = fileCfg.CredsPath
+				}
+			}
+		}
+	}
+
+	// 环境变量始终优先
 	if v := os.Getenv("AUTO_EXIT_SEC"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			autoExitSec = n
+			cfg.AutoExitSec = n
 		}
 	}
 
-	if !filepath.IsAbs(credPath) {
-		execPath, _ := os.Executable()
-		if execPath != "" {
-			credPath = filepath.Join(filepath.Dir(execPath), credPath)
+	return cfg
+}
+
+// ============ SSE 日志端点 ============
+func (h *handler) serveLogs(w http.ResponseWriter, r *http.Request) {
+	if h.authToken != "" && !h.checkAuth(w, r) {
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "sse not supported", 500)
+		return
+	}
+
+	// 先发送所有历史日志
+	hist := globalLog.getAll()
+	for _, l := range hist {
+		fmt.Fprintf(w, "event: log\ndata: {\"ts\":\"%s\",\"msg\":%q,\"kind\":\"%s\"}\n\n", l.Ts, l.Msg, l.Kind)
+	}
+	flusher.Flush()
+
+	ch := make(chan string, 64)
+	globalLog.addSSE(ch)
+	defer globalLog.removeSSE(ch)
+
+	// 保持连接，每 25s 发一次空 comment 保活
+	for {
+		select {
+		case payload, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprint(w, payload)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		case <-time.After(25 * time.Second):
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
 		}
 	}
+}
+
+// ============ 入口 ============
+func main() {
+	cfg := loadConfig()
+	credPath := resolvePath(cfg.CredsPath)
 
 	if _, err := os.Stat(credPath); os.IsNotExist(err) {
-		logf("⚠️ 凭据文件不存在: %s，将无法加载 Key", credPath)
+		defaultCreds := `# OpenRouter API Key 代理配置文件
+# 格式：OPENROUTER_API_KEY 或 OPENROUTER{N}_API_KEY : your-key
+# OPENROUTER_API_KEY（无数字）优先级最高，会优先使用
+# OPENROUTER2_API_KEY、OPENROUTER3_API_KEY … 按数字顺序轮询
+# Key 格式应为 sk-or-v1-xxxx，Dashboard 的 Key 管理页面可查看
+
+OPENROUTER_API_KEY: sk-or-v1-YOUR_KEY_HERE
+`
+		if err := os.WriteFile(credPath, []byte(defaultCreds), 0644); err != nil {
+			logf("⚠️ 凭据文件不存在，且自动创建失败: %v", err)
+		} else {
+			logf("📄 凭据文件不存在，已自动创建: %s\n   ➜ 请编辑文件填入你的 API Key 后重启程序", credPath)
+		}
 	}
 
+	refreshInterval := time.Duration(cfg.RefreshMinutes) * time.Minute
+
 	h := &handler{
-		upstream:   upstream,
+		upstream:   cfg.Upstream,
 		credPath:   credPath,
-		bind:       bind,
-		authToken:  authToken,
+		bind:       cfg.Bind,
+		authToken:  cfg.AuthToken,
 		cooldown:   newCooldownMgr(),
 		state:      newState(),
 		freeModels: newFreeModelsCache(),
 		keyManager: newKeyManager(),
-		heartbeat:  newHeartbeatMgr(autoExitSec),
+		heartbeat:  newHeartbeatMgr(cfg.AutoExitSec),
 	}
 
 	keys, err := loadKeys(credPath)
 	if err == nil && len(keys) > 0 {
-		h.freeModels.startBackgroundRefresh(keys[0].key)
+		h.freeModels.startBackgroundRefresh(keys[0].key, refreshInterval)
 	} else {
 		logf("⚠️ 无可用 Key，免费模型刷新跳过")
 	}
 
-	if autoExitSec > 0 {
+	if cfg.AutoExitSec > 0 {
 		h.heartbeat.startMonitor()
-		logf("💓 心跳检测已开启，Dashboard 关闭后 %d 秒自动退出", autoExitSec)
+		logf("💓 心跳检测已开启，Dashboard 关闭后 %d 秒自动退出", cfg.AutoExitSec)
 	}
 
-	addr := fmt.Sprintf("%s:%s", bind, port)
+	addr := fmt.Sprintf("%s:%s", cfg.Bind, cfg.Port)
 	scheme := "http"
-	if bind != "127.0.0.1" && bind != "localhost" && bind != "[::1]" {
+	if cfg.Bind != "127.0.0.1" && cfg.Bind != "localhost" && cfg.Bind != "[::1]" {
 		scheme = "🔓 http(远程开放)"
 	}
-	logf("🚀 启动: %s://%s → https://%s", scheme, addr, upstream)
+	logf("🚀 启动: %s://%s → https://%s", scheme, addr, cfg.Upstream)
 	logf("📄 凭据: %s", credPath)
 	logf("🩺 健康: http://%s/health", addr)
 	logf("📊 面板: http://%s/", addr)
-	if authToken != "" {
+	if cfg.AuthToken != "" {
 		logf("🔐 远程认证: X-Auth-Token header 或 ?token= query")
 	}
 

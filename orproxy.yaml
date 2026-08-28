@@ -1,0 +1,24 @@
+# ORProxy 配置文件
+# 启动时若不存在则自动创建此文件
+# 所有配置项均可通过同名环境变量覆盖（环境变量优先）
+
+# 监听端口
+port: "8787"
+
+# 监听地址（127.0.0.1=仅本机，0.0.0.0=允许远程访问）
+bind: "127.0.0.1"
+
+# 上游服务器（代理目标域名或 IP）
+upstream: "openrouter.ai"
+
+# 免费模型列表刷新间隔（分钟）
+refresh_minutes: 15
+
+# 自动退出：Dashboard 关闭后多少秒退出（0=不自动退出）
+auto_exit_sec: 0
+
+# 远程认证 Token（留空则不认证，支持 header: X-Auth-Token 或 query: ?token=xxx）
+auth_token: ""
+
+# 凭据文件路径（Key 列表，与配置文件分离）
+creds_path: "orproxy-creds.yaml"

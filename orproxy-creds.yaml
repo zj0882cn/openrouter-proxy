@@ -1,0 +1,7 @@
+# OpenRouter API Key 代理配置文件
+# 格式：OPENROUTER_API_KEY 或 OPENROUTER{N}_API_KEY : your-key
+# OPENROUTER_API_KEY（无数字）优先级最高，会优先使用
+# OPENROUTER2_API_KEY、OPENROUTER3_API_KEY … 按数字顺序轮询
+# Key 格式应为 sk-or-v1-xxxx，Dashboard 的 Key 管理页面可查看
+
+OPENROUTER_API_KEY: sk-or-v1-YOUR_KEY_HERE

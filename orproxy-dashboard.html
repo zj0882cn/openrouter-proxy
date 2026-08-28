@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ORProxy</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background: #0f1117; color: #e0e0e0; font-size: 14px; height: 100vh; overflow: hidden; }
+
+  header { background: #161b22; border-bottom: 1px solid #30363d; height: 52px; display: flex; align-items: center; padding: 0 20px; gap: 16px; flex-shrink: 0; }
+  header h1 { font-size: 16px; color: #58a6ff; font-weight: 700; }
+  .status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #8b949e; }
+  .status .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .status .dot.ok { background: #3fb950; box-shadow: 0 0 5px #3fb950; }
+  .status .dot.bad { background: #f85149; }
+  .spacer { flex: 1; }
+  .url { font-size: 12px; color: #484f58; font-family: monospace; }
+  .menu-btn { padding: 5px 12px; background: #21262d; border: 1px solid #30363d; border-radius: 4px; color: #c9d1d9; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .menu-btn:hover { background: #30363d; }
+
+  .app { display: flex; height: calc(100vh - 52px); overflow: hidden; }
+  #sidebar { width: 0; overflow: hidden; transition: width 0.25s; background: #161b22; border-right: 1px solid #30363d; display: flex; flex-direction: column; flex-shrink: 0; }
+  #sidebar.open { width: 340px; overflow-y: auto; }
+  #sidebar::-webkit-scrollbar { width: 4px; }
+  #sidebar::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+
+  .menu-section { border-bottom: 1px solid #21262d; }
+  .menu-section:last-child { border-bottom: none; flex: 1; }
+  .menu-section-header { padding: 10px 14px; font-size: 11px; font-weight: 700; color: #484f58; text-transform: uppercase; letter-spacing: 0.08em; }
+
+  .sidebar-keys { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .key-item { background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; }
+  .key-item-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .key-item-name { font-size: 12px; font-weight: 600; color: #c9d1d9; font-family: monospace; }
+  .key-item-mask { font-size: 11px; color: #484f58; font-family: monospace; }
+  .key-item-row { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+  .key-item .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .key-item .dot.ok { background: #3fb950; }
+  .key-item .dot.cool { background: #f0883e; }
+  .key-item .dot.paused { background: #8b949e; }
+  .cool-til { font-size: 11px; color: #f0883e; margin-top: 4px; font-family: monospace; }
+  .key-actions { display: flex; gap: 4px; margin-top: 8px; }
+  .key-actions button { flex: 1; padding: 4px 6px; background: #30363d; border: 1px solid #484f58; border-radius: 4px; color: #c9d1d9; font-size: 11px; cursor: pointer; font-family: inherit; }
+  .key-actions button:hover { background: #484f58; }
+  .key-actions button.pause-btn { color: #f0883e; }
+  .key-actions button.resume-btn { color: #3fb950; }
+  .key-actions button.remove-btn { color: #f85149; }
+  .no-keys { padding: 12px 14px; font-size: 12px; color: #484f58; text-align: center; }
+
+  .add-key-form { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .add-key-form input { width: 100%; padding: 7px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e0e0e0; font-size: 12px; font-family: monospace; }
+  .add-key-form input:focus { outline: none; border-color: #58a6ff; }
+  .add-key-form .hint { font-size: 10px; color: #484f58; min-height: 14px; font-family: monospace; }
+  .add-key-form button { width: 100%; padding: 7px; background: #238636; border: 1px solid #2ea043; border-radius: 4px; color: #fff; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .add-key-form button:hover { background: #2ea043; }
+
+  .rule-box { background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 8px 10px; font-size: 11px; color: #8b949e; line-height: 1.8; }
+  .rule-box strong { color: #c9d1d9; }
+
+  .info-rows { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .info-row { display: flex; flex-direction: column; gap: 3px; }
+  .info-label { font-size: 10px; color: #484f58; text-transform: uppercase; letter-spacing: 0.06em; }
+  .info-value { font-size: 12px; color: #c9d1d9; font-family: monospace; background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 5px 8px; word-break: break-all; }
+  .info-value.accent { color: #58a6ff; }
+
+  .shutdown-wrap { padding: 12px; margin-top: auto; }
+  .shutdown-wrap button { width: 100%; padding: 8px; background: #da3633; border: 1px solid #f85149; border-radius: 4px; color: #fff; font-size: 12px; cursor: pointer; font-family: inherit; font-weight: 600; }
+  .shutdown-wrap button:hover { background: #f85149; }
+
+  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+  #logPanel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  #logHeader { background: #161b22; border-bottom: 1px solid #30363d; padding: 6px 16px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  #logHeader span { font-size: 12px; color: #8b949e; }
+  #logCount { font-size: 11px; color: #484f58; margin-left: auto; }
+  #logConsole { flex: 1; overflow-y: auto; font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: 12px; line-height: 1.8; padding: 8px 16px; background: #0d1117; }
+  #logConsole::-webkit-scrollbar { width: 5px; }
+  #logConsole::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+  .log-line { white-space: pre-wrap; word-break: break-all; display: flex; gap: 0; }
+  .log-line .ts { color: #484f58; flex-shrink: 0; margin-right: 10px; min-width: 80px; }
+  .log-line .msg { flex: 1; }
+  .log-line.ok .msg { color: #3fb950; }
+  .log-line.warn .msg { color: #f0883e; }
+  .log-line.err .msg { color: #f85149; }
+  .log-line.info .msg { color: #58a6ff; }
+
+  #testPanel { flex-shrink: 0; border-top: 1px solid #30363d; background: #161b22; }
+  #testPanel.collapsed { height: 40px; overflow: hidden; cursor: pointer; }
+  #testPanel.expanded { max-height: 300px; overflow-y: auto; }
+  #testToggle { width: 100%; padding: 8px 16px; background: #161b22; border: none; border-bottom: 1px solid #21262d; color: #8b949e; font-size: 12px; cursor: pointer; font-family: inherit; text-align: left; display: flex; align-items: center; gap: 6px; }
+  #testToggle:hover { background: #21262d; color: #c9d1d9; }
+  #testBody { padding: 10px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .test-row { display: flex; gap: 8px; align-items: flex-start; }
+  .test-row select { padding: 6px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e0e0e0; font-size: 12px; min-width: 160px; }
+  .test-row select:focus { outline: none; border-color: #58a6ff; }
+  .test-row textarea { flex: 1; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e0e0e0; font-size: 12px; font-family: inherit; resize: none; min-height: 50px; }
+  .test-row textarea:focus { outline: none; border-color: #58a6ff; }
+  .test-row textarea::placeholder { color: #484f58; }
+  .send-btn { padding: 7px 16px; background: #238636; border: 1px solid #2ea043; border-radius: 4px; color: #fff; font-size: 12px; cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .send-btn:hover { background: #2ea043; }
+  .send-btn:disabled { background: #21262d; border-color: #30363d; color: #484f58; cursor: default; }
+  #testOutput { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 8px 10px; font-family: monospace; font-size: 11px; color: #c9d1d9; white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow-y: auto; line-height: 1.6; }
+  #testOutput.error { border-color: #f85149; color: #f85149; }
+  #testMeta { font-size: 10px; color: #484f58; margin-top: 4px; font-family: monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🌐 ORProxy</h1>
+  <div class="status"><div class="dot ok" id="statusDot"></div><span id="statusText">运行中</span></div>
+  <div class="spacer"></div>
+  <div class="url" id="apiBaseUrl"></div>
+  <button class="menu-btn" id="menuBtn" onclick="toggleSidebar()">☰ 菜单</button>
+</header>
+
+<div class="app">
+  <div id="sidebar"></div>
+  <div id="main">
+    <div id="logPanel">
+      <div id="logHeader"><span>📋 实时日志</span><span id="logCount">0 条</span></div>
+      <div id="logConsole"></div>
+    </div>
+    <div id="testPanel" class="collapsed">
+      <div id="testToggle" onclick="toggleTest()">💬 发送测试</div>
+      <div id="testBody" style="display:none;">
+        <div class="test-row">
+          <select id="modelSel"><option value="">— 选择模型 —</option></select>
+          <textarea id="promptInput" placeholder="输入问题…" rows="2"></textarea>
+          <button class="send-btn" id="sendBtn" onclick="doSend()">发送 ▶</button>
+        </div>
+        <div id="testOutput">等待输入…</div>
+        <div id="testMeta"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const base = window.location.origin;
+document.getElementById('apiBaseUrl').textContent = base + '/v1';
+
+let sidebarOpen = false, cachedKeys = [], cachedModels = [];
+let logEs;
+
+// ===== 侧边栏 =====
+function toggleSidebar() {
+  sidebarOpen = !sidebarOpen;
+  const sb = document.getElementById('sidebar');
+  if (sidebarOpen) { sb.classList.add('open'); document.getElementById('menuBtn').textContent = '✕ 关闭'; renderSidebar(); }
+  else { sb.classList.remove('open'); document.getElementById('menuBtn').textContent = '☰ 菜单'; }
+}
+
+function renderSidebar() {
+  document.getElementById('sidebar').innerHTML = `
+    <div class="menu-section">
+      <div class="menu-section-header">🔑 Key 管理</div>
+      <div class="sidebar-keys" id="sidebarKeys">${renderKeyItems(cachedKeys)}</div>
+      <div class="add-key-form">
+        <input type="text" id="addKeyInput" placeholder="粘贴 Key（sk-or-v1-…）" oninput="showKeyHint(this)">
+        <div class="hint" id="keyHint"></div>
+        <button onclick="doAddKey()">➕ 添加</button>
+      </div>
+    </div>
+    <div class="menu-section">
+      <div class="menu-section-header">📖 轮询规则</div>
+      <div style="padding:0 12px 12px;">
+        <div class="rule-box">
+          <strong>① 优先级</strong><br>OPENROUTER_API_KEY 优先，其他按数字顺序轮询。<br><br>
+          <strong>② 429 冷却</strong><br>触发限速后冷却 90s～数小时，不阻塞其他 Key。<br><br>
+          <strong>③ 402/403 跳过</strong><br>额度不足不冷却，立即试下一条。<br><br>
+          <strong>④ 暂停 Key</strong><br>暂停不删除文件，重启后恢复。
+        </div>
+      </div>
+    </div>
+    <div class="menu-section">
+      <div class="menu-section-header">🔗 接入说明</div>
+      <div class="info-rows">
+        <div class="info-row"><div class="info-label">API 地址</div><div class="info-value accent">${base}/v1</div></div>
+        <div class="info-row"><div class="info-label">健康检查</div><div class="info-value">${base}/health</div></div>
+        <div class="info-row"><div class="info-label">Python 示例</div><div class="info-value">openai.base_url = "<span style="color:#58a6ff">${base}/v1</span>"</div></div>
+        <div class="info-row"><div class="info-label">免费模型</div><div class="info-value" id="modelCountInfo">${cachedModels.length} 个</div></div>
+      </div>
+    </div>
+    <div class="shutdown-wrap"><button onclick="doShutdown()">⏹ 关闭程序</button></div>
+  `;
+  syncModelSelect();
+}
+
+function renderKeyItems(keys) {
+  if (!keys || keys.length === 0) return '<div class="no-keys">暂无 Key</div>';
+  return keys.map(k => {
+    const dot = k.paused ? 'paused' : (k.cooling ? 'cool' : 'ok');
+    const label = k.paused ? '已暂停' : (k.cooling ? '冷却中' : '正常');
+    const coolHtml = k.cooling && k.cool_until ? `<div class="cool-til">至 ${k.cool_until}</div>` : '';
+    const actions = k.paused
+      ? `<button class="resume-btn" onclick="doResume('${k.name}')">▶ 恢复</button>`
+      : `<button class="pause-btn" onclick="doPause('${k.name}')">⏸ 暂停</button>`;
+    return `<div class="key-item">
+      <div class="key-item-top">
+        <span class="key-item-name">${k.name}</span>
+        <span class="key-item-mask">🔒 ····${k.mask}</span>
+      </div>
+      <div class="key-item-row"><span class="dot ${dot}"></span><span>${label}</span></div>
+      ${coolHtml}
+      <div class="key-actions">${actions}<button class="remove-btn" onclick="doRemove('${k.name}')">🗑 删除</button></div>
+    </div>`;
+  }).join('');
+}
+
+function showKeyHint(input) {
+  const el = document.getElementById('keyHint');
+  const val = input.value.trim();
+  if (!val) { el.textContent = ''; return; }
+  if (!val.startsWith('sk-or-v1-')) { el.textContent = '❌ 格式错误'; el.style.color = '#f85149'; return; }
+  el.textContent = '🔒 ····' + val.slice(-4);
+  el.style.color = '#484f58';
+}
+
+async function doAddKey() {
+  const val = document.getElementById('addKeyInput').value.trim();
+  if (!val || !val.startsWith('sk-or-v1-')) { alert('Key 格式不对'); return; }
+  try {
+    const r = await fetch(base + '/keys/add', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key: val}) });
+    const t = await r.text();
+    if (r.ok) {
+      document.getElementById('addKeyInput').value = '';
+      document.getElementById('keyHint').textContent = '';
+      loadKeys();
+      if (sidebarOpen) renderSidebar();
+    } else { alert('添加失败: ' + t); }
+  } catch(e) { alert('请求失败: ' + e.message); }
+}
+
+async function doPause(n) { await fetchKeyOp('pause', n); }
+async function doResume(n) { await fetchKeyOp('resume', n); }
+async function doRemove(n) { if (!confirm('删除 ' + n + '？')) return; await fetchKeyOp('remove', n); }
+async function fetchKeyOp(op, name) {
+  try {
+    const r = await fetch(base + '/keys/' + op, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key: name}) });
+    await r.text();
+    loadKeys();
+    if (sidebarOpen) renderSidebar();
+  } catch(e) {}
+}
+
+async function doShutdown() {
+  if (!confirm('确定关闭程序？')) return;
+  try { await fetch(base + '/shutdown', {method:'POST'}); } catch(e) {}
+  document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;background:#0f1117;color:#e0e0e0;font-family:sans-serif;"><h1 style="color:#f85149;">⏹ 已关闭</h1></div>';
+}
+
+// ===== 日志渲染（SSE 驱动）=====
+let logLines = [];
+const logConsole = document.getElementById('logConsole');
+
+function appendLog(ts, msg, kind) {
+  const div = document.createElement('div');
+  div.className = 'log-line ' + (kind || '');
+  div.innerHTML = `<span class="ts">${esc(ts)}</span><span class="msg">${esc(msg)}</span>`;
+  logConsole.appendChild(div);
+  logLines.push({ts, msg, kind});
+  if (logLines.length > 500) {
+    logConsole.removeChild(logConsole.firstChild);
+    logLines.shift();
+  }
+  logConsole.scrollTop = logConsole.scrollHeight;
+  document.getElementById('logCount').textContent = logLines.length + ' 条';
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ===== SSE 连接 =====
+function connectLogs() {
+  if (logEs) { logEs.close(); logEs = null; }
+  logEs = new EventSource(base + '/logs');
+  logEs.addEventListener('log', function(e) {
+    try {
+      const d = JSON.parse(e.data);
+      appendLog(d.ts, d.msg, d.kind);
+    } catch(ex) {}
+  });
+  logEs.onerror = function() {
+    logEs.close(); logEs = null;
+    setTimeout(connectLogs, 5000);
+  };
+}
+
+// ===== 测试面板 =====
+let testExpanded = false;
+function toggleTest() {
+  testExpanded = !testExpanded;
+  const p = document.getElementById('testPanel');
+  const b = document.getElementById('testBody');
+  if (testExpanded) { p.classList.remove('collapsed'); p.classList.add('expanded'); b.style.display = 'flex'; document.getElementById('testToggle').textContent = '💬 发送测试 ▲'; }
+  else { p.classList.add('collapsed'); p.classList.remove('expanded'); b.style.display = 'none'; document.getElementById('testToggle').textContent = '💬 发送测试 ▼'; }
+}
+
+function syncModelSelect() {
+  const sel = document.getElementById('modelSel');
+  sel.innerHTML = '<option value="">— 选择模型 —</option>';
+  cachedModels.forEach(m => sel.add(new Option(m.name, m.id)));
+}
+
+async function doSend() {
+  const model = document.getElementById('modelSel').value;
+  const prompt = document.getElementById('promptInput').value.trim();
+  if (!model) { alert('请选择模型'); return; }
+  if (!prompt) { alert('请输入问题'); return; }
+  const btn = document.getElementById('sendBtn');
+  const out = document.getElementById('testOutput');
+  const meta = document.getElementById('testMeta');
+  btn.disabled = true; btn.textContent = '⏳…';
+  out.textContent = ''; out.className = ''; meta.textContent = '';
+  try {
+    const r = await fetch(base + '/v1/chat/completions', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({model, messages:[{role:'user',content:prompt}], max_tokens:500})
+    });
+    const text = await r.text();
+    if (r.ok) {
+      const j = JSON.parse(text);
+      out.textContent = (j.choices&&j.choices[0]&&j.choices[0].message||{}).content||'(无)';
+      const u = j.usage||{};
+      meta.textContent = `✅ | prompt:${u.prompt_tokens||'?'} output:${u.completion_tokens||'?'}`;
+    } else {
+      out.textContent = text; out.className = 'error';
+      meta.textContent = `❌ HTTP ${r.status}`;
+    }
+  } catch(e) {
+    out.textContent = e.message; out.className = 'error';
+  }
+  btn.disabled = false; btn.textContent = '发送 ▶';
+}
+
+// ===== 数据加载 =====
+async function loadKeys() {
+  try {
+    const r = await fetch(base + '/keys');
+    const d = await r.json();
+    cachedKeys = d.keys || [];
+    if (sidebarOpen) renderSidebar();
+  } catch(e) {}
+}
+async function loadModels() {
+  try {
+    const r = await fetch(base + '/v1/free-models');
+    const d = await r.json();
+    cachedModels = d.models || [];
+    syncModelSelect();
+    if (sidebarOpen) document.getElementById('modelCountInfo').textContent = cachedModels.length + ' 个';
+  } catch(e) {}
+}
+async function poll() {
+  try {
+    const r = await fetch(base + '/health');
+    const d = await r.json();
+    document.getElementById('statusDot').className = 'dot ok';
+    document.getElementById('statusText').textContent = '运行中 · ' + d.keys.length + ' Key';
+  } catch(e) {
+    document.getElementById('statusDot').className = 'dot bad';
+    document.getElementById('statusText').textContent = '请求异常';
+  }
+}
+
+// ===== 页面生命周期 =====
+window.addEventListener('beforeunload', () => {
+  if (navigator.sendBeacon) navigator.sendBeacon(base + '/page-closed');
+  else fetch(base + '/page-closed', {method:'POST',keepalive:true}).catch(()=>{});
+  if (logEs) logEs.close();
+});
+
+connectLogs();
+loadKeys(); loadModels(); poll();
+setInterval(poll, 10000);
+</script>
+</body>
+</html>
