@@ -1528,67 +1528,53 @@ func (h *handler) upstreamFree(method, path string, body []byte) (*http.Response
 }
 
 func (h *handler) copyResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
+	// reasoning 模型返回 content="" 但 reasoning 有内容时,填充 content 避免客户端报错
+	if resp.StatusCode == 200 {
+		if filled := tryFillEmptyContent(body); len(filled) > 0 {
+			body = filled
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
-	// 修复:某些推理模型 (如 nemotron reasoning) 返回 content="" 但 reasoning 有内容
-	// 对 OpenAI 兼容客户端 (Copilot/Cline) 会导致 "Response contained no choices"
-	// 这里把 reasoning 提取出来填到 content
-	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "json") {
-		body = patchEmptyContent(body)
-	}
 	w.Write(body)
 }
 
-// patchEmptyContent 修复 content 为空但 reasoning 非空的情况
-// 仅在 chat completions 响应中处理
-func patchEmptyContent(body []byte) []byte {
-	var resp struct {
-		Choices []struct {
-			Message struct {
-				Content          string `json:"content"`
-				Reasoning        string `json:"reasoning"`
-				ReasoningDetails []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"reasoning_details"`
-			} `json:"message"`
-		} `json:"choices"`
+// 当 message.content 为空但 message.reasoning 有内容时,填充 content
+func tryFillEmptyContent(body []byte) []byte {
+	var parsed map[string]interface{}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return body
+	choices, ok := parsed["choices"].([]interface{})
+	if !ok || len(choices) == 0 {
+		return nil
 	}
-	patched := false
-	for i := range resp.Choices {
-		if resp.Choices[i].Message.Content == "" {
-			if resp.Choices[i].Message.Reasoning != "" {
-				resp.Choices[i].Message.Content = resp.Choices[i].Message.Reasoning
-				patched = true
-			} else if len(resp.Choices[i].Message.ReasoningDetails) > 0 {
-				var sb strings.Builder
-				for _, d := range resp.Choices[i].Message.ReasoningDetails {
-					if d.Text != "" {
-						sb.WriteString(d.Text)
-					}
-				}
-				if sb.Len() > 0 {
-					resp.Choices[i].Message.Content = sb.String()
-					patched = true
-				}
-			}
+	changed := false
+	for _, c := range choices {
+		choice, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		msg, ok := choice["message"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content, hasContent := msg["content"].(string)
+		reasoning, hasReasoning := msg["reasoning"].(string)
+		if hasContent && content == "" && hasReasoning && reasoning != "" {
+			msg["content"] = reasoning
+			changed = true
 		}
 	}
-	if !patched {
-		return body
+	if changed {
+		out, _ := json.Marshal(parsed)
+		return out
 	}
-	out, err := json.Marshal(resp)
-	if err != nil {
-		return body
-	}
-	return out
+	return nil
 }
 
 // ============ 配置加载 ============
