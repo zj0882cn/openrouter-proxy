@@ -1528,6 +1528,25 @@ func (h *handler) upstreamFree(method, path string, body []byte) (*http.Response
 }
 
 func (h *handler) copyResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
+	// 修复: content 为空时用 reasoning 填充（reasoning 模型返回 content="" 但 reasoning 有内容）
+	var parsed map[string]interface{}
+	if json.Unmarshal(body, &parsed) == nil {
+		if choices, ok := parsed["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if msg, ok := choice["message"].(map[string]interface{}); ok {
+					content, hasContent := msg["content"].(string)
+					if hasContent && content == "" {
+						if reasoning, ok := msg["reasoning"].(string); ok && reasoning != "" {
+							msg["content"] = reasoning
+						}
+					}
+					// 填充回 body
+					body, _ = json.Marshal(parsed)
+				}
+			}
+		}
+	}
+
 	w.WriteHeader(resp.StatusCode)
 	for k, vv := range resp.Header {
 		for _, v := range vv {
