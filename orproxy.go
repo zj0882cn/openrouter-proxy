@@ -1528,32 +1528,67 @@ func (h *handler) upstreamFree(method, path string, body []byte) (*http.Response
 }
 
 func (h *handler) copyResponse(w http.ResponseWriter, resp *http.Response, body []byte) {
-	// 修复: content 为空时用 reasoning 填充（reasoning 模型返回 content="" 但 reasoning 有内容）
-	var parsed map[string]interface{}
-	if json.Unmarshal(body, &parsed) == nil {
-		if choices, ok := parsed["choices"].([]interface{}); ok && len(choices) > 0 {
-			if choice, ok := choices[0].(map[string]interface{}); ok {
-				if msg, ok := choice["message"].(map[string]interface{}); ok {
-					content, hasContent := msg["content"].(string)
-					if hasContent && content == "" {
-						if reasoning, ok := msg["reasoning"].(string); ok && reasoning != "" {
-							msg["content"] = reasoning
-						}
-					}
-					// 填充回 body
-					body, _ = json.Marshal(parsed)
-				}
-			}
-		}
-	}
-
 	w.WriteHeader(resp.StatusCode)
 	for k, vv := range resp.Header {
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
+	// 修复:某些推理模型 (如 nemotron reasoning) 返回 content="" 但 reasoning 有内容
+	// 对 OpenAI 兼容客户端 (Copilot/Cline) 会导致 "Response contained no choices"
+	// 这里把 reasoning 提取出来填到 content
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "json") {
+		body = patchEmptyContent(body)
+	}
 	w.Write(body)
+}
+
+// patchEmptyContent 修复 content 为空但 reasoning 非空的情况
+// 仅在 chat completions 响应中处理
+func patchEmptyContent(body []byte) []byte {
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content          string `json:"content"`
+				Reasoning        string `json:"reasoning"`
+				ReasoningDetails []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"reasoning_details"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return body
+	}
+	patched := false
+	for i := range resp.Choices {
+		if resp.Choices[i].Message.Content == "" {
+			if resp.Choices[i].Message.Reasoning != "" {
+				resp.Choices[i].Message.Content = resp.Choices[i].Message.Reasoning
+				patched = true
+			} else if len(resp.Choices[i].Message.ReasoningDetails) > 0 {
+				var sb strings.Builder
+				for _, d := range resp.Choices[i].Message.ReasoningDetails {
+					if d.Text != "" {
+						sb.WriteString(d.Text)
+					}
+				}
+				if sb.Len() > 0 {
+					resp.Choices[i].Message.Content = sb.String()
+					patched = true
+				}
+			}
+		}
+	}
+	if !patched {
+		return body
+	}
+	out, err := json.Marshal(resp)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // ============ 配置加载 ============
