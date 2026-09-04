@@ -1,1 +1,6 @@
 orproxy-x86
+python/
+.run/server.pid
+start_proxy.sh
+orproxy
+onboard.sh
