@@ -1,6 +1,16 @@
-orproxy-x86
-python/
-.run/server.pid
-start_proxy.sh
+# Binaries
 orproxy
-onboard.sh
+orproxy.exe
+orproxy-x86
+.run/
+
+# Credentials
+*creds*.yaml
+
+# Python
+python/__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
