@@ -23,3 +23,31 @@ auth_token: "ts2026proxy"
 
 # 凭据文件路径（Key 列表，与配置文件分离）
 creds_path: "orproxy-creds.yaml"
+
+# ===== 重试/限速参数 =====
+# 429 冷却时间（秒），默认 10。OpenRouter 触发的限流通常 5~15s 后恢复
+cooldown_429_sec: 10
+
+# 401 冷却时间（秒），默认 86400（24h）。401 表示 key 无效/被删除
+cooldown_401_sec: 86400
+
+# 403 冷却时间（秒），默认 3600（1h）。403/402 表示付费额度不足
+cooldown_403_sec: 3600
+
+# 同一 key 的最小调用间隔（秒），默认 6。DSH 策略：成功也冻结 6s，429 冻结 10s
+per_key_delay_sec: 6
+
+# 所有 key 冷却时，等待重试间隔（秒），默认 3
+wait_retry_sec: 3
+
+# 所有 key 冷却时，最大等待时间（秒），默认 30。超过后继续尝试（可能得到 502）
+wait_max_sec: 30
+
+# fallback 轮询重试间隔（秒），默认 3
+fallback_retry_sec: 3
+
+# fallback 最大总超时（秒），默认 60。超过后放弃并返回 502
+fallback_max_sec: 60
+
+# 两轮重试之间的 sleep 时间（秒），默认 10。让 429 冷却有时间恢复
+between_rounds_sec: 10
