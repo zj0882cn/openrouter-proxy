@@ -1,6 +1,6 @@
 # ORProxy · OpenRouter 多账号代理
 
-> 🏷️ **版本**：v0.1-demo（Demo 第一版）
+> 🏷️ **版本**：v1.3.0（修复 IPv4、Bearer Auth、日志分离）
 >
 > Go 1.x · 单文件可执行 · 跨平台 · 内嵌 Web Dashboard
 >
@@ -193,6 +193,16 @@ curl http://127.0.0.1:8787/health
 
 ## 📜 版本历史
 
+- **v1.3.0**（2026-09-07）— 修复 + 增强
+  - ✅ 修复 IPv6 双栈导致的 `ERR_CONNECTION_RESET`（改用 `net.Listen("tcp4", addr)` 仅 IPv4 监听）
+  - ✅ 新增 `Authorization: Bearer <token>` 认证支持（VS Code / OpenAI SDK 兼容）
+  - ✅ 新增 `Proxy-Authorization: Bearer` / `Basic` 认证支持
+  - ✅ 客户端 ID 改为 8 字符 hex 随机 ID（短 ID，避免日志过长）
+  - ✅ Cookie 持久化客户端 ID（30 天）
+  - ✅ 首次访问检测 + 6 阶段日志格式（📥🎯🔑🌐↗️📤）
+  - ✅ 日志文件分离：`debug.log`（DEBUG 级别）/ `info.log` / `error.log`
+  - ✅ 完整请求/响应包调试日志（`logDebug()` 记录所有 HTTP 头）
+
 - **v0.1-demo**（2026-08-28）— Demo 第一版
   - 多 Key 轮询 + 429/402/403 智能换线
   - 可视化增删/暂停 Key
@@ -203,6 +213,21 @@ curl http://127.0.0.1:8787/health
   - 健康检查 / 自动退出 / 远程认证
 
 ---
+
+## 🔐 认证方式（v1.3.0）
+
+远程访问时（`bind: 0.0.0.0` 且 `auth_token` 非空），支持以下任一方式：
+
+| 方式 | 示例 |
+|------|------|
+| `X-Auth-Token` 头 | `X-Auth-Token: ts2026proxy` |
+| URL Query 参数 | `?token=ts2026proxy` |
+| `Authorization: Bearer` 头 | `Authorization: Bearer ts2026proxy` |
+| `Authorization: Basic` 头 | `Authorization: Basic <base64(token)>` |
+| `Proxy-Authorization: Bearer` 头 | `Proxy-Authorization: Bearer ts2026proxy` |
+| `Proxy-Authorization: Basic` 头 | `Proxy-Authorization: Basic <base64(token)>` |
+
+> 本机访问（`127.0.0.1` / `localhost`）始终免认证。
 
 ## 📚 客户端集成详细说明
 
