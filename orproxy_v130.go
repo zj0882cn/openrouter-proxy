@@ -6,9 +6,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -213,11 +216,37 @@ func formatBytes(n int) string {
 }
 
 func writeLogToFile(msg string) {
-	if err := os.MkdirAll("./log", 0755); err == nil {
-		now := time.Now()
-		hourKey := now.Format("20060102-15")
-		logFile := fmt.Sprintf("./log/%s-info.log", hourKey)
-		if f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+	if err := os.MkdirAll("./log", 0755); err != nil {
+		return
+	}
+	now := time.Now()
+	hourKey := now.Format("20060102-15")
+	
+	// 分离不同级别的日志
+	if strings.HasPrefix(msg, "[DEBUG]") {
+		// DEBUG: 写入 debug.log (包含所有请求/响应包详情)
+		debugFile := fmt.Sprintf("./log/%s-debug.log", hourKey)
+		if f, err := os.OpenFile(debugFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			f.WriteString(msg + "\n")
+			f.Close()
+		}
+	} else if strings.HasPrefix(msg, "[ERROR]") {
+		// ERROR: 写入 error.log
+		errorFile := fmt.Sprintf("./log/%s-error.log", hourKey)
+		if f, err := os.OpenFile(errorFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			f.WriteString(msg + "\n")
+			f.Close()
+		}
+		// 同时写入 info.log
+		infoFile := fmt.Sprintf("./log/%s-info.log", hourKey)
+		if f, err := os.OpenFile(infoFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			f.WriteString(msg + "\n")
+			f.Close()
+		}
+	} else {
+		// INFO/WARN: 写入 info.log
+		infoFile := fmt.Sprintf("./log/%s-info.log", hourKey)
+		if f, err := os.OpenFile(infoFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 			f.WriteString(msg + "\n")
 			f.Close()
 		}
@@ -431,7 +460,6 @@ func tryOpenrouterFree(data []byte) ([]byte, int, bool) {
 // ---- 2) OpenRouter Keys (轮转 + 互斥锁 + 冷却) ----
 // v1.3.0: pickCandidates 优化 - 冷却剩余 < 2s 的 key 也参与尝试
 func pickCandidates() []int {
-	now := time.Now()
 	start := 0
 	lastGoodMu.Lock()
 	if lastGoodIdx >= 0 && lastGoodIdx < len(orKeys)-1 {
@@ -599,6 +627,13 @@ func extractRequestID(r *http.Request) string {
 	return ""
 }
 
+// v1.3.0: 生成8字符随机hex客户端ID
+func generateShortClientID() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
 // ---- v1.3.0: 客户端 ID 管理 ----
 func getOrCreateClientID(r *http.Request) string {
 	// 优先级: Cookie > X-Client-Id header > 生成新 ID
@@ -609,13 +644,13 @@ func getOrCreateClientID(r *http.Request) string {
 		return cliID
 	}
 	// 生成新 ID（由调用方通过 SetCookie 下发）
-	return fmt.Sprintf("orproxy-%d", time.Now().UnixNano())
+	return generateShortClientID()
 }
 
 // ---- 主处理逻辑 ----
 func handleChatCompletions(w http.ResponseWriter, r *http.Request, body []byte) {
 	reqStartTime := time.Now()
-	
+
 	// v1.3.0: 客户端 ID 和请求 ID
 	cliID := getOrCreateClientID(r)
 	reqID := extractRequestID(r)
@@ -623,7 +658,19 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request, body []byte) 
 		reqID = fmt.Sprintf("orproxy-%d", time.Now().UnixNano())
 	}
 	w.Header().Set("X-ORProxy-Request-Id", reqID)
-	
+
+	// v1.3.0: 新建客户端ID则下发Cookie持久化（30天）
+	if _, err := r.Cookie("orproxy_cli"); err != nil {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "orproxy_cli",
+			Value:    cliID,
+			Path:     "/",
+			MaxAge:   86400 * 30,
+			HttpOnly: false,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+
 	// v1.3.0: 检查是否首次访问
 	isFirst := checkFirstVisit(cliID)
 	
@@ -879,7 +926,12 @@ func main() {
 			w.WriteHeader(204)
 			return
 		}
-		// v1.3.0: 认证检查
+		// v1.3.0: 认证检查 (支持 X-Auth-Token, Authorization: Bearer, ?token=, Proxy-Authorization)
+		// 记录完整请求包到debug日志
+		debugReqPacket := fmt.Sprintf("=== [%s] REQUEST ===\n%s %s\nHost: %s\nHeaders: %v\n", 
+			time.Now().Format("15:04:05.000"), r.Method, r.URL.String(), r.Host, r.Header)
+		logDebug(debugReqPacket)
+		
 		if config.AuthToken != "" {
 			host := r.Host
 			if !(strings.HasPrefix(host, "127.") || host == "localhost" || host == "[::1]") {
@@ -887,7 +939,36 @@ func main() {
 				if token == "" {
 					token = r.URL.Query().Get("token")
 				}
+				// 支持 Authorization: Bearer <token>
+				if token == "" {
+					if auth := r.Header.Get("Authorization"); auth != "" {
+						if strings.HasPrefix(auth, "Bearer ") {
+							token = strings.TrimPrefix(auth, "Bearer ")
+						} else if strings.HasPrefix(auth, "Basic ") {
+							decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
+							if err == nil {
+								token = string(decoded)
+							}
+						}
+					}
+				}
+				// 支持 Proxy-Authorization: Bearer <token> 或 Basic <base64>
+				if token == "" {
+					if proxyAuth := r.Header.Get("Proxy-Authorization"); proxyAuth != "" {
+						if strings.HasPrefix(proxyAuth, "Bearer ") {
+							token = strings.TrimPrefix(proxyAuth, "Bearer ")
+						} else if strings.HasPrefix(proxyAuth, "Basic ") {
+							decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(proxyAuth, "Basic "))
+							if err == nil {
+								token = string(decoded)
+							}
+						}
+					}
+				}
 				if token != config.AuthToken {
+					logWarn("认证失败: token=%q host=%s", token, host)
+					debugRespPacket := fmt.Sprintf("=== [%s] RESPONSE 401 ===\n{\"error\":{\"message\":\"unauthorized\"}}\n", time.Now().Format("15:04:05.000"))
+					logDebug(debugRespPacket)
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusUnauthorized)
 					json.NewEncoder(w).Encode(map[string]interface{}{
@@ -976,8 +1057,15 @@ func main() {
 		handleChatCompletions(w, r, body)
 	})
 
+	// 显式 TCP4 监听（避免 Go 默认把 0.0.0.0 转 IPv6 wildcard，导致 IPv4 包被丢弃）
+	addr := fmt.Sprintf("%s:%d", config.Bind, config.Port)
+	listener, err := net.Listen("tcp4", addr)
+	if err != nil {
+		log("监听失败 %s: %v", addr, err)
+		return
+	}
+
 	server := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", config.Bind, config.Port),
 		Handler: handler,
 	}
 
@@ -991,7 +1079,7 @@ func main() {
 	}()
 
 	log("🚀 服务启动 http://%s:%d/v1 | %d 个 Key | v1.3.0 | log_level=%s", config.Bind, config.Port, len(orKeys), config.LogLevel)
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
+	if err := server.Serve(listener); err != http.ErrServerClosed {
 		log("服务器启动失败: %v", err)
 	}
 }
